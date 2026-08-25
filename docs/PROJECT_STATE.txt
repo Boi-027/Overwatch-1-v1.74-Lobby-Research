@@ -332,7 +332,7 @@ The server->client direction is ALSO fully decrypted: 94 frames, 383,890 of
 383,890 bytes, 100%. This is the first known plaintext of real OW1 lobby
 traffic in either direction.
 
-  The s2c key was contributed by **Zagrion** (OWDev/Prometheus Discord) within
+  The s2c key was contributed by **Zagrion** (AyakaPS) within
   hours of this project being published, after he redid the TCP reassembly with
   tshark. The key had been tried and rejected locally because a hand-rolled
   scapy reassembly mishandled overlapping retransmits - one byte of
