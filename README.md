@@ -63,7 +63,7 @@ Key schedule, confirmed against that traffic:
 MAC1           = HMAC-SHA256(k0, cn || sn)
 MAC2           = HMAC-SHA256(k1, sn || cn)
 c2s cipher key = HMAC-SHA256(k3, sn || cn)
-s2c cipher key = not yet recovered (k2 expected)
+s2c cipher key = HMAC-SHA256(k2, cn || sn) 
 ```
 
 Four separate 64-byte key slots, one role each, sourced from the Battle.net
