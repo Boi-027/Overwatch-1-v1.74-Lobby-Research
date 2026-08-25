@@ -1,1 +1,631 @@
+================================================================================
+  Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
+  Build 104319, Windows x64 (QA-dev build)
+  Last updated: 2026-08-25 (rev 3)
+================================================================================
 
+MAIN GOAL
+----
+Reach the main menu + lootbox screen on a fully local/offline server.
+No gameplay, no matchmaking. Game preservation, own machine, own copy. (We can leave that to iEvE lmao)
+
+CONVENTIONS USED IN THIS DOCUMENT
+---------------------------------
+<GAME>   = your Overwatch 1.74 install root, containing Overwatch\_retail_\
+<TOOLS>  = wherever you keep lobbyserv.py, cainj.cpp, owobs.cpp, etc.
+<LOGS>   = a directory you create for --tank_logpath output
+<DUMPS>  = a directory for owobs region dumps
+
+All code addresses are RVAs (offsets from image base). To make IDA match,
+rebase the program to 0: Edit > Segments > Rebase program > 0.
+
+
+################################################################################
+##  READ THIS FIRST - MAJOR CORRECTION (2026-08-25)
+################################################################################
+
+A large block of prior reverse-engineering work was based on a
+MISIDENTIFICATION. If you have an older copy of this document, discard its
+"accept mechanism" section entirely.
+
+WHAT WENT WRONG
+---------------
+On 2026-08-11, two handler functions were identified by decrypting the
+client's log-format strings and matching them to a names table:
+
+    0x86BEE0  -> "ResponseConnect"
+    0x86F432  -> "ResponseLogin"     (also seen as 0x86C320 in older notes)
+    0x261AB68 -> names table
+
+These were assumed to be the LOBBY protocol's connect/login handlers.
+
+They are not. They belong to the VOICE CHAT client.
+
+HOW IT WAS CAUGHT
+-----------------
+The names table at 0x261AB68 was examined in IDA. Its full contents:
+
+    ResponseConnect, ResponseLogin, LoggedOut, LoggedIn, LoggingIn,
+    LoggingOut, Resetting, ResponseLogout, ResponseDisconnect,
+    ResponseJoinChannel, ResponseStartTransmit, ResponseLeaveChannel,
+    Disconnected, Connected, Ringing, Connecting, Disconnecting,
+    ChannelConnection, SetOutputVolume, SetInputVolume
+
+JoinChannel / StartTransmit / LeaveChannel / SetInputVolume /
+SetOutputVolume / Ringing are voice chat concepts. This is the VC client's
+message table.
+
+Corroborating evidence, in the game's own log file (--tank_logpath):
+
+    [NRM] [VoiceChat] ... #=[VC] ResponseGetOutputDevices 01 0(0:811c9dc5) (...)
+    [NRM] [VoiceChat] ... #=[VC] ResponseSetActiveOutputDevice 02 0(0:811c9dc5)
+
+That output format - name, 2-digit number, 0(0:<fnv>), parenthesized string
+fields - is EXACTLY what 0x86BEE0 constructs. 0x811C9DC5 is FNV-1a of the
+empty string, the same constant the function seeds its two string loops with.
+The channel tag on every such line is [VoiceChat].
+
+WHY IT FOOLED ME FOR THREE WEEKS 😭
+--------------------------------------
+- The handler dispatch table is PER-CONNECTION (conn+0x250). msgid 0x101 maps
+  to completely different handlers on different connection types. Finding a
+  handler at slot 0x101 never implied it was the lobby's.
+- The msgid gate is "<= 0x4F0", so 0x100/0x101 are plausible ids in many
+  tables. The numbers matching meant nothing.
+- The identification came from strings tagged [VC], which was visible in the
+  evidence from day one and not questioned.
+- Every symptom was consistent with "we haven't cracked it yet" rather than
+  "we're looking at the wrong subsystem": the pending map read empty during a
+  lobby park (because VoiceChat was not connecting), no high-entropy token
+  ever appeared (because no VC connect was pending), and the lobby client
+  closed the socket no matter what was echoed (because nothing was answering
+  what the lobby actually wanted).
+
+LESSON FOR WHOEVER PICKS THIS UP
+--------------------------------
+Before investing in a handler, confirm which SUBSYSTEM's table it belongs to.
+Dump the whole names table, not just the entry you were looking for. If the
+neighbours are about audio devices, you are in the wrong place.
+
+
+################################################################################
+##  SECTION 1: WHAT IS SOLVED AND VERIFIED (lobby-side, still good)
+################################################################################
+
+Everything in this section was validated independently of the VoiceChat
+mistake and remains correct.
+
+[SOLVED] JAM cipher - reimplemented server-side in lobbyserv.py (Jam class).
+  Known-answer test (independently confirmed by a second implementer):
+    key    = 00 01 02 ... 1f  (bytes 0x00 through 0x1F)
+    first 64 bytes of keystream:
+      f07e5df1c8d51c0d754da6ddde34cca01db0ed26334eb94ae277135a0764c6a6
+      794d7ab0cc0978ef43de30766a7ee1d7c90e159df239d4016d450fa3d8207842
+  If your implementation reproduces this, your cipher is correct.
+
+[SOLVED] 292-byte state blob.
+  BLOB_KEY (64 bytes):
+    35 86 F3 62 8A 63 1B 70 57 12 40 5B 8A CC 71 D4
+    0F D1 67 0C C1 B0 3E A3 84 97 4A 6F B1 A7 61 96
+    B1 42 F0 B7 23 10 EA 81 16 D0 0A 4C 35 2F 09 AC
+    DB FB 50 A6 3E C5 15 3E 62 E4 D6 7F E0 9B EE CC
+  Construction:
+    256-byte body, body[i] = i & 0xFF
+    body[0]        = 0x02
+    body[1:5]      = 7F 00 00 01        (127.0.0.1)
+    body[255]      = 0xFF               (forces blob >= n, RSA path skipped)
+    body[176:208]  = HMAC-SHA256(BLOB_KEY, body[0:176] + body[208:256])
+    + 36 trailing zero bytes            => 292 bytes total
+
+[SOLVED] Handshake to state 6.
+    C->S  "HELLO PRO CLIENT\0"                  (17 bytes)
+    S->C  "HELLO PRO SERVER\0"                  (17 bytes)
+    C->S  [8 bytes padding][32-byte cn]         (40 bytes)
+    S->C  [32-byte srv_rand][1 byte difficulty=0][32-byte sn]
+    C->S  [8 bytes padding][32-byte MAC1]       (40 bytes)
+          MAC1 = HMAC-SHA256(ZERO_KEY, cn || sn)
+    S->C  MAC2 || JAM(blob)
+          MAC2 = HMAC-SHA256(ZERO_KEY, sn || cn)
+  Keys:
+    rx (server->client) = HMAC-SHA256(ZERO_KEY, cn || sn)
+    tx (client->server) = HMAC-SHA256(ZERO_KEY, sn || cn)
+  ZERO_KEY = 32 zero bytes.
+
+  CRITICAL: MAC2 and the blob are ONE CONTINUOUS cipher stream. Do not
+  reinitialize JAM between them. If you send them as separate socket writes,
+  the leftover keystream from the partial block must carry over. Encrypt all
+  292 blob bytes in the same stream, offset 0, no header. Getting this wrong
+  produces a client that decrypts the blob, counts all 292 bytes, and then
+  silently closes - a very confusing failure mode.
+
+[SOLVED] Counter gate on the first reply.
+  The connection counter at conn+0x88 initializes to 1, and a reply's parsed
+  index field must be BELOW it. So the FIRST server reply must carry
+  counter = 0. Encoding 01 00 00 00 is the value 1, not 0 - this exact
+  off-by-one silently killed every reply for weeks.
+
+[SOLVED] Wire frame format for server replies.
+    [u16be msgid][u32le counter][u32le family = 0x11D82194]
+    [u16be bnet-hdr-len][protobuf Header{service_id=0xFE, token, size, status}]
+    [protobuf body]
+  Outer framing: [u24be length][payload]
+
+[SOLVED] Injection chain that survives Arxan.
+  bink2w64.dll (proxy) -> loads bink2w64_original.dll + your DLLs.
+  Rename the real bink2w64.dll to bink2w64_original.dll and drop the proxy in
+  its place under <GAME>\Overwatch\_retail_\.
+  ALL ~75 Bink exports must be forwarded via
+    #pragma comment(linker, "/export:NAME=bink2w64_original.NAME")
+  A single missing export produces a "Failed to load" dialog before any of
+  your code runs. Verify with: dumpbin /exports bink2w64.dll
+
+[SOLVED] Arxan constraints - what works and what does not.
+  - VirtualProtect on Overwatch.exe's own .text: BLOCKED EVERYWHERE.
+    Measured: 11,408 of 11,408 executable pages denied, all err=87.
+    This is blanket, not regional. Inline code hooking (MinHook trampolines)
+    is impossible inside the game module. MH_EnableHook returns error 10
+    (MH_ERROR_MEMORY_PROTECT).
+  - Inline hooking of EXTERNAL modules (winmm.dll etc.) WORKS fine. Verified
+    with a MinHook probe on timeGetTime: hook installed, process survived.
+  - Heap writes (WriteProcessMemory / direct writes to heap objects) work with
+    no Arxan reaction.
+  - SuspendThread trips the Arxan watchdog - the client dies at arming.
+  - PAGE_GUARD on image (SEC_IMAGE) pages: unsupported, VirtualProtect err=87.
+  - x64dbg + ScyllaHide (all presets): defeated. No live debugger, no
+    breakpoints.
+  - Surviving toolset: plain ReadProcessMemory from an external tool, plus an
+    in-process injected DLL doing reads and heap writes only.
+
+[SOLVED] pe-sieve dump characteristics.
+  Dumping the live process yields DECRYPTED .text (code is reliable, and this
+  is what you load in IDA). However .rdata (vtables, message schema, string
+  tables) is ENCRYPTED and shifted by roughly 0x10000. Treat every data-section
+  address from the dump as untrustworthy; read data live instead.
+  Consequence in IDA: indirect calls through vtables cannot be followed
+  statically, and xrefs that pass through .rdata do not resolve.
+
+
+################################################################################
+##  SECTION 2: LOBBY-SIDE FACTS (still believed correct)
+################################################################################
+
+LAUNCH (tournament mode - bypasses bnet login, dials the lobby directly)
+    cd /d "Overwatch\_retail_"
+    Overwatch.exe --tank_TournamentMode --lobbyServer=127.0.0.1:3724 --console --tank_logpath "<LOGS FOLDER>"
+
+  START -> ENTER GAME dials 127.0.0.1:3724. No bnet contact in this mode.
+  Note: tournament mode locks alt-tab; use Ctrl+Alt+Del to escape.
+
+OBSERVED TRAFFIC (this is lobby-side and trustworthy)
+  After state 6 the client sends, JAM-encrypted:
+      0100 01000000 9421d811     (10 bytes)  msgid 0x100, counter, family
+      0103                       (2 bytes)   retransmit/poll
+  Then it cleanly closes if unsatisfied. It sends the SAME bytes every
+  connection - there is no visible per-connect nonce on the wire.
+
+  A TYPE-2 reply (0102 01000000 9421d811) is tolerated by the client.
+
+FAMILY ID: 0x11D82194
+  Appears in every lobby frame. Believed to be the ClientOut (client->server)
+  pool identifier. Whether a distinct ClientIn pool id exists in 1.74 is
+  UNRESOLVED - see open questions.
+
+FAMILY REGISTRATION: RVA 0x2CF0060
+  Contains 4 receive variants (01-04) and the ASCII name "0x11d82194".
+  Descriptors carry schema fields and parse-function code pointers
+  (0x4A0450, 0x56CA50). This was found independently of the VoiceChat trail
+  and is genuinely lobby-side. GOOD STARTING POINT.
+
+DISPATCHER: RVA 0x41DB60  (verified in IDA, lobby-side, trustworthy)
+  Gate conditions:
+      msgid != 0
+      msgid <= 0x4F0
+      conn+0x20 == 6                (connection state)
+      conn+0x10 <= small value
+      handler list at conn+0x250 non-empty
+  conn+0x250 is an INTRUSIVE DOUBLY-LINKED LIST HEAD. It is empty iff
+  [conn+0x250] == conn+0x250 (the classic "cmp [r13], r13" idiom).
+
+  What the dispatcher actually does (from the 0x41DE27 region):
+      movsxd rbp, [rsi]           ; msgid
+      lea    rcx, [rdi + 0x260]   ; allocator pool on the connection
+      call   0x41B7C0             ; allocate a record (this is an ALLOCATOR,
+                                  ;   NOT a handler lookup - older notes had
+                                  ;   this wrong)
+      mov    [rbx + 4], ebp       ; record+4 = msgid
+      call   0x24E8B70            ; memcpy(record+0x18, payload, size)
+      ... intrusive list insert onto conn+0x250 ...
+
+  KEY POINT: the dispatcher only QUEUES. It never calls a handler. Something
+  else drains that list asynchronously and invokes the handler. THAT DRAINER
+  HAS NOT BEEN FOUND, and finding it is probably the most valuable next step
+  (see Section 4).
+
+SESSION OBJECT (found by vtable scan; lobby-side)
+  vtable window : 0x26160A0 .. 0x26162A0
+  session vtable: 0x2616260
+    +0x60  status  (2 = reject, 7 = accept, 0 = waiting)
+    +0x70  state   (small enum 0..7; anything larger means the object is dead
+                    and the heap slot was reused - ALWAYS liveness-check this)
+    +0x98  delivered-message slot
+    +0x1A0 cn (32 bytes)
+    +0x1C0 sn (32 bytes)
+    +0x2F0, +0x2F8 markers
+
+  Observed reject cycle on a park:
+      state=6 status=6  ->  status=2 (verdict, ~1.1s later)  ->  status=0
+
+  Completion callback  RVA 0xE38590 (session vtable slot 1):
+      reads [session+0x60]; 7 -> success continuation 0xE39C20,
+      0 -> keep waiting, anything else -> fail 0xE39A80
+  Success() RVA 0xE38600 sets status = 7
+  state>2 predicate RVA 0xE38620
+
+
+
+################################################################################
+##  SECTION 2B: LIVE WIRE EXPERIMENTS (2026-08-25) - msgid 0x003 and limits
+################################################################################
+
+After the VoiceChat correction the reply msgid was known to be unfounded
+(0x100/0x101/0x102 came from VoiceChat's table). A series of live experiments
+followed. Results, in order:
+
+MSGID SWEEP (reply id 0x001..0x090, one per connection)
+  Every id closed the socket at 0.00s after the reply - EXCEPT 0x003, which
+  held it open. Reproduced repeatedly:
+      0x003 held= 20.02s,  4 exchanges
+      0x003 held=234.79s, 46 exchanges
+      0x003 held= 78.45s, 15 exchanges
+  With 0x003 the client polls its 2-byte 0103 frame indefinitely and the
+  server answers each one; the connection survives to the 300s server-side
+  timeout instead of dying instantly.
+
+IN-CONNECTION PROBE SWEEP (0x003 keepalive + one probe id per exchange)
+  Failed immediately and informatively: sending ANY other msgid down the live
+  socket collapses it in ~5s. 234s/46 exchanges without probes became
+  5.01s/1 exchange with. 0x003 is the ONLY tolerated id.
+
+BODY IRRELEVANCE (accidental but clean)
+  A gating bug meant every reply in one run carried an EMPTY body instead of
+  the 168-byte captured bgs blob. Client behaviour was identical - same 300s
+  hold, same endless 0103 polling. THE BODY IS NOT BEING PARSED.
+
+SHORT-FRAME SWEEP (2-byte [01][XX] replies, XX = 0x00..0x08)
+  Rationale: the client's 0103 is a 2-byte control frame with no counter and
+  no family id, unlike its 10-byte 0100 - answering it with a 180-byte
+  protobuf envelope may be a category error.
+  Result: all closed at 0.00s except echoing 0103 back, which bought 5.00s
+  and one exchange. Not a state change.
+
+INTERPRETATION
+  0x003 is almost certainly a benign/ignored id that fails to trip the
+  validation-failure teardown path, NOT a handshake step. The client has
+  never demonstrably consumed anything the server sent. Treat 0x003 as a
+  useful keepalive that buys a long-lived socket for experimentation, and
+  nothing more.
+
+  Practical value: with 0x003 you get a stable 300-second connection instead
+  of an instant disconnect. That is a much better platform for any future
+  experiment than reconnecting for every trial.
+
+
+################################################################################
+##  SECTION 2C: REAL BLIZZARD LOBBY TRAFFIC DECRYPTED (2026-08-25)
+################################################################################
+
+A packet capture of a genuine Overwatch 1 lobby session (retail, client
+192.168.3.44 -> Blizzard 37.244.13.27:3724) was obtained together with a dump
+of the connection's four 64-byte key slots. The client->server direction has
+been FULLY DECRYPTED: 211 frames, 61,712 of 61,712 bytes consumed with zero
+parse errors. This is the first known plaintext of real OW1 lobby traffic.
+
+KEY SCHEDULE - CONFIRMED AGAINST REAL TRAFFIC
+    MAC1            = HMAC-SHA256(k0, cn || sn)     (client -> server)
+    MAC2            = HMAC-SHA256(k1, sn || cn)     (server -> client)
+    c2s cipher key  = HMAC-SHA256(k3, sn || cn)     (JAM key, client->server)
+    s2c cipher key  = NOT YET RECOVERED (k2 expected; see below)
+
+  Four separate 64-byte key slots, one role each. In tournament mode all four
+  are zero, which is why lobbyserv's ZERO_KEY works locally - but the general
+  structure is the above. k0..k3 come from the Battle.net session; they are not
+  derivable from the handshake.
+
+TRUE SERVER PREAMBLE (byte offsets in the reassembled stream)
+    [  0] "HELLO PRO SERVER\0"            17 bytes
+    [ 17] srv_rand                        32 bytes
+    [ 49] difficulty                       1 byte   (0x09 here, 0x07 in another
+                                                     capture; lobbyserv sends 0)
+    [ 50] sn                              32 bytes
+    [ 82] MAC2                            32 bytes
+    [114] state blob                     292 bytes  <-- 292 CONFIRMED on the
+                                                        real server
+    [406] JAM-encrypted frames ...
+
+  NOTE: 2-byte 0x0000 packets appear in the capture before HELLO, before the
+  65-byte block and before MAC2. These are CAPTURE ARTIFACTS - they carry the
+  same TCP sequence numbers as the real packets (duplicate/window probes) and
+  are NOT protocol bytes. lobbyserv's preamble shape is correct as-is.
+
+FRAME FORMAT
+    [u24be frame_len][u16be msgid][ ... ]
+  For msgid 0x4401 the next field is a u32le payload length; verified on 96 of
+  96 such frames. For other msgids the third field is msgid-dependent (it is a
+  counter for some, e.g. 0x5000 increments by 4).
+
+REAL MSGID INVENTORY (client -> server, retail build)
+    0x4401 x96   0x1a13 x94   0x5000 x5    0x0003 x4    0x1502 x2
+    0x1900 x2    0x1a07 x2    0x0000 x1    0x1200 x1    0x1209 x1
+    0x4c00 x1    0x1800 x1    0x1f00 x1
+  These are RETAIL ids and will not match the 1.74 QA-dev build directly.
+  What transfers is the grammar, not the numbers.
+
+  Notable: the real client sends bare TWO-BYTE frames (0x0003, 0x4c00) in the
+  middle of an otherwise healthy session. This is the same shape as the 0103
+  frame the 1.74 client sends. Two-byte frames are a legitimate message type,
+  not a malformed poll.
+
+SAMPLE DECRYPTED FRAMES (real client -> real server)
+    [  334] 0000 52000000 4e65a800a800fb0befeffe0d52bd...
+    [  730] 1200 00000000 ...4c9e163a000000006f725000...
+    [    5] 1209 525500
+    [   22] 1502 01000000 3fe15a42000000000000000000000001
+    [    7] 5000 01030000 00
+    [  337] 4401 4b010000 f0170e3ee12c5d7d9f6774a1cb4c...   (0x14b = 331 = len-6)
+    [    2] 0003
+    [    7] 5000 01070000 00
+    [  350] 4401 58010000 ...                                (0x158 = 344 = len-6)
+
+WHY THE SERVER DIRECTION IS STILL ENCRYPTED
+  No HMAC of k0..k3 over the handshake nonces yields valid framing on the
+  server stream. The likely cause is not the key but TCP reassembly: the
+  post-blob segments overlap (offset 406 length 6, then offset 411 length 109 -
+  a one-byte overlap), and a single byte of misalignment destroys a stream
+  cipher's output for everything downstream. Proper overlap-aware reassembly is
+  the next thing to try, then re-test k2 derivations.
+
+  Recovering the server direction is now the single highest-value target in the
+  project: it would show, in real bytes, exactly what a genuine lobby server
+  replies - which is precisely the unknown that has blocked every attempt.
+
+################################################################################
+##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
+################################################################################
+
+These addresses and the entire theory built on them apply to the VOICE CHAT
+client. They are accurately decoded; they are simply the wrong subsystem.
+Kept here so nobody rediscovers them and repeats the mistake.
+
+    0x86BEE0   VC ResponseConnect handler
+    0x86F432   VC ResponseLogin handler (older notes said 0x86C320)
+    0x85FFE0   VC pending-connect map lookup
+    0x860090   near-identical sibling of the above
+    0x261AB68  VC message names table
+    0x2F53030  assumed "manager" global - never held anything relevant
+    0x2F63214  VC entry type tag (a magic-static that initializes to 0)
+    0x2D0C818  encrypted [VC] log format string
+    0x2D0C848  encrypted [VC] log format string
+
+ALSO NOT WHAT THEY WERE LABELLED (checked 2026-08-25):
+    0x4A0450   NOT a message parse function. It is a constructor/initializer
+               loop over 0x58-byte objects that stores the constant
+               0x800000000000000F into obj+0x40. That constant shows up in
+               memory scans as a false-positive "key".
+    0x56CA50   NOT a message parse function. STL container internals -
+               uninitialized_copy / move loops striding 0x40-byte elements.
+    0x41B7C0   NOT a handler lookup. It is a size-class ALLOCATOR, called by
+               the dispatcher to allocate the queued message record.
+    sub_84B668 / sub_76854B  Arxan-obfuscated blobs. Whole-function views
+               produce junk (enter with absurd operands, sar ch/0, imul with
+               garbage displacements). Individual basic blocks disassemble
+               fine; function entries do not.
+
+VOID THEORY: "the server must echo an 8-byte pending-connect token that the
+client holds in memory". That is a real mechanism - in the VOICE CHAT client.
+There is no evidence the lobby protocol works this way.
+
+For reference, the VC mechanism decoded correctly (may help if anyone ever
+wants local voice chat):
+    map object   = handler's arg1 - 8   (multiple-inheritance base fixup;
+                   the manager has a vtable at +0 and a second at +8)
+    list head    = [map + 0x1D8]
+    entry layout : vtable @ +0, next @ +0x10, key @ +0x18,
+                   flag BYTE @ +0x28 (must be 0), state @ +0x40
+    type check   : virtual call [entry_vtable + 8] compared to the tag global
+    on accept    : ResponseConnect writes msg+0x18/+0x1C to entry+0xF0/+0xF4
+                   and sets entry+0x40 = 4
+                   ResponseLogin  writes msg+0x18/+0x1C to entry+0x170/+0x174
+                   and sets entry+0x40 = 6
+    So 4 = connected, 6 = logged in, and the entry is at least 0x178 bytes.
+
+ALSO VOID: owobs versions v41 through v47. Every one of them hunted the VC
+pending map. The scanning machinery (session finder, liveness gating, poison
+filtering, region dumping) is reusable; the targets are not.
+
+
+################################################################################
+##  SECTION 4: OPEN QUESTIONS / WHERE TO GO NEXT
+################################################################################
+
+Ordered by estimated value.
+
+1. FIND THE LOBBY HANDLER TABLE.
+   The dispatcher requires a non-empty list at conn+0x250 for the LOBBY
+   connection. Something registers lobby handlers into it. Find that
+   registration and you have the real equivalents of the functions in
+   Section 3.
+   Approach: start from the family registration at 0x2CF0060 (genuinely
+   lobby-side). In IDA, Shift+F12 for strings, look for lobby-domain names
+   (Lobby, Party, GameServer, EnterGame, Matchmaking, Queue).
+
+2. FIND THE QUEUE DRAINER.
+   The dispatcher queues records onto conn+0x250 and returns. Whatever pops
+   that list and calls the handler is the function that constructs the
+   handler's "this". In IDA, text-search (Alt+T) for 250h and look for a
+   function that walks [reg+0x250], follows [node+8] links, and ends in an
+   indirect call.
+   Caveat: much of this region is Arxan-obfuscated. Attempting to view the
+   containing function start (e.g. sub_84B668) yields junk instructions
+   (enter with absurd operands, sar ch,0, imul with garbage displacements).
+   Individual basic blocks disassemble fine; whole-function views do not.
+
+3. WHAT DOES THE 0103 FRAME ACTUALLY WANT?  <-- THE CENTRAL QUESTION
+   The client sends 0100 (10 bytes: msgid + counter + family) then 0103
+   (2 bytes, no counter, no family), then closes unless answered with msgid
+   0x003. Everything tried so far - protobuf envelopes with the captured bgs
+   body, empty bodies, error statuses, 2-byte control frames across
+   0x00..0x08, and 1,264 candidate msgids - leaves it polling forever or
+   tears the socket down. Three independent implementers have reached this
+   exact point and none has passed it.
+   The reply grammar is still unknown. This is the whole problem.
+
+4. IS THERE A DISTINCT ClientIn POOL ID?
+   All replies stamp family 0x11D82194, which is likely the ClientOut
+   (client->server) identifier. If server->client frames need a different
+   pool id, every reply ever sent has been rejected at the family router.
+   Approach: scan for the strings "ClientInLobbyConnect" /
+   "ClientOutLobbyConnect", locate the pool objects, read their CRCs.
+   Cross-check against overtools CRC32 string lists.
+
+5. POST-CONNECT PATH TO THE MENU.
+   Entirely unexplored. On OW 0.8 beta the server proactively pushes
+   ClientInLobbyConnect messages (ids 20503/20504/20505, channel 10) to drive
+   DISCONNECTED -> CONNECTED -> menu. On 1.74, pushing BEFORE the client's own
+   connect request races it and causes immediate teardown (verified). If
+   pushing applies at all here, it is POST-connect.
+
+6. LOOTBOXES???
+   Not started. Presumably needs an inventory service response. Beyond all of
+   the above.
+
+
+################################################################################
+##  SECTION 5: RULED OUT - DO NOT RETRY
+################################################################################
+
+- PROACTIVE PUSH BEFORE CONNECT. Sending server->client messages before the
+  client issues its own connect request races it; the client tears down the
+  socket. An observe-only build confirmed the client behaves normally when the
+  server stays quiet. Reply, do not push.
+
+- FORCING THE VERDICT FIELD (session+0x60 = 7). Six variants tried: hold from
+  park, pin on send, reactive flip, sustained hold, pin on the 0103 frame.
+  The flip works mechanically (Arxan does not object to the heap write) and
+  the client's retry loop even stops - but it then stalls, and the socket
+  still closes. Socket close is a transport/protocol decision decoupled from
+  the verdict dword, and the flip cannot conjure the session data the menu
+  path needs. DEAD END.
+
+- DERIVING A TOKEN FROM THE HANDSHAKE NONCES. HMAC-SHA256, SHA256, FNV-1a,
+  FNV-1, CRC32, djb2, SDBM, joaat tested over cn/sn in many orderings.
+  No match to anything. (Also: this was chasing the VoiceChat token.)
+
+- INLINE CODE HOOKING INSIDE Overwatch.exe. See Section 1 - blanket
+  VirtualProtect denial, all 11,408 executable pages.
+
+- x64dbg + ScyllaHide. Defeated by Arxan at every preset.
+
+- USING DUMP .rdata ADDRESSES. Encrypted and shifted ~0x10000. Code only.
+
+- IDA ON THE pe-sieve DUMP AS A GENERAL SOLVENT. Worth doing - it caught the
+  VoiceChat misidentification and confirmed the 0x85FFE0 offsets - but it does
+  NOT get past the two real obstacles. Indirect calls go through vtables in
+  encrypted .rdata so xrefs do not resolve, and function entries are
+  control-flow-flattened so whole-function views are junk. Expect to read
+  individual basic blocks, not functions.
+
+- REPLY MSGIDS OTHER THAN 0x003. All of 0x001..0x090 tested as the main reply;
+  all close the socket at 0.00s. Any non-0x003 id sent down a live 0x003
+  connection collapses it within ~5s.
+
+- VARYING THE REPLY BODY. Empty body and the 168-byte captured bgs body
+  produce identical client behaviour. The body is not being parsed.
+
+- COMMAND-LINE FLAGS --key AND --QuickLogin. The client's connect frame is
+  byte-identical (0100 01000000 9421d811) regardless of --key value, so --key
+  does not reach the lobby handshake despite its help text ("connection key
+  for the server"). --QuickLogin changes nothing at this stage either.
+  Note: there is NO log-level flag in this build; the full option list has
+  been checked. Lobby-side logging cannot be turned on from the command line.
+
+- CLIENT-SIDE STATE FORCING A LA PROMETHEUS (saturn-xvi/prometheus, artpop2).
+  That project reaches the menu on OW 0.8 BETA by patching anti-debug and
+  forcing client state, with no server implementation at all. On 0.8 the
+  client boots to a menu regardless of server. On 1.74 it does NOT - it hard
+  blocks waiting for a server reply. Their technique also relies on inline
+  code patching, which 1.74's Arxan blocks outright. Their code contains no
+  login/connect/server logic whatsoever, so there is nothing to port. (Is what I believe)
+
+
+################################################################################
+##  SECTION 6: TOOLING REFERENCE
+################################################################################
+
+FILES (place next to Overwatch.exe, i.e. <GAME>\Overwatch\_retail_\)
+    bink2w64.dll            proxy loader (replaces the original)
+    bink2w64_original.dll   the real Bink DLL, renamed
+    cainj.dll               cert/CA injection (only needed for the bnet route)
+    owobs.dll               observer / memory scanner
+
+BUILD (MSVC x64 Developer Command Prompt, from <TOOLS>)
+    cl /nologo /LD /O2 /D_CRT_SECURE_NO_WARNINGS bink2w64.cpp
+    cl /nologo /LD /O2 /D_CRT_SECURE_NO_WARNINGS cainj.cpp
+    cl /nologo /LD /O2 /D_CRT_SECURE_NO_WARNINGS /Fe:owobs.dll owobs.cpp
+  With MinHook (external-module hooking only - useless inside the game):
+    cl /nologo /LD /O2 /D_CRT_SECURE_NO_WARNINGS /I minhook\include ^
+       yourfile.cpp minhook\src\*.c minhook\src\hde\*.c
+
+  After every build, copy the DLL to <GAME>\Overwatch\_retail_\ - forgetting
+  this step silently runs the old build and wastes a test cycle. Check the
+  version banner in your log before trusting a run. Note that append-mode logs
+  show the OLDEST banner first.
+
+LOGS AND OUTPUT
+    <LOGS>\Overwatch.log    the game's own log (--tank_logpath). Create the
+                            directory first; if it does not exist the flag is
+                            silently ignored.
+    <TOOLS>\owobs_log.txt   observer output
+    <TOOLS>\cainj_log.txt   cert injection output
+    <DUMPS>\region_*.bin    code region dumps
+
+SERVER
+    lobbyserv.py            raw TCP + JAM on 127.0.0.1:3724. This is NOT an
+                            HTTPS server.
+    bnetserv.py             separate HTTPS stub on 127.0.0.1:443 for the
+                            non-tournament login route. Needs admin to bind
+                            443. Requires a CA cert that cainj injects.
+
+BNET / CERT ROUTE (alternative path, only if you want the real login screen)
+  Skip --tank_TournamentMode. The client then goes through web-auth first and
+  will sit forever on "CONNECTING..." unless a local HTTPS server answers.
+  hosts entries needed (point at 127.0.0.1):
+      us.actual.battle.net
+      eu.actual.battle.net
+      account.blizzard.com
+      oauth.battle.net
+      us.battle.net
+  Leave telemetry hosts alone; they are not needed for the menu.
+  cainj.cpp injects a CA into the client's live cert store using the game's own
+  add-cert function and zeroes a verify_mode field - both DATA writes, which is
+  why it survives Arxan. Point its PEM_PATH at your CA.
+  STATUS: unfinished. Another implementer solved this wall and reached the
+  actual login form, then got stuck at the same lobby wall described above, so
+  this route converges on the same open problem.
+
+
+################################################################################
+##  SECTION 7: COMMUNITY / RELATED WORK
+################################################################################
+
+Three people have independently reached the same lobby wall (client sends
+0100, then 0103, then closes) and none has passed it.
+
+Related projects worth reading:
+  - Prometheus (github.com/saturn-xvi/prometheus, branch artpop2) - OW 0.8 beta,
+    client-side state forcing, reaches an in-game state with a hollow client
+    (menu buttons non-functional, voice/comms stubbed). No server code.
+  - Gophercraft - its bnet conn.go documents the real bnet RPC envelope format
+    used by the Header structure described in Section 1.
+  - overtools - CRC32 string lists, useful for resolving hashed pool names.
+
+Communities: OWDev / Prometheus Discord.
