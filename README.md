@@ -1,7 +1,6 @@
 # Overwatch 1.74 - Lobby Protocol Research
 
-Reverse-engineering the Overwatch 1 lobby protocol (build **1.74.0.0 / 104319**,
-Windows x64 QA-dev) with the goal of reaching the main menu on a fully local,
+Reverse-engineering the Overwatch 1 lobby protocol (build **1.74.0.0 / 104319**), with the goal of reaching the main menu on a fully local,
 offline server. Game preservation, own machine, own copy.
 
 **Status: not finished.** The transport layer is solved and a client will
