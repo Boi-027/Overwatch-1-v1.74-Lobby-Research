@@ -12,7 +12,7 @@ No gameplay, no matchmaking. Game preservation, own machine, own copy. (We can l
 CONVENTIONS USED IN THIS DOCUMENT
 ---------------------------------
 <GAME>   = your Overwatch 1.74 install root, containing Overwatch\_retail_\
-<TOOLS>  = wherever you keep lobbyserv.py, cainj.cpp, owobs.cpp, etc.
+<TOOLS>  = wherever you keep lobbyserv.py, cainj.cpp, owobs.cpp, etc. (MAKE SURE TO UPDATE THE PATHS TO YOUR OWN PATHS, I MARKED THEM IN THE CODE ITSELF)
 <LOGS>   = a directory you create for --tank_logpath output
 <DUMPS>  = a directory for owobs region dumps
 
