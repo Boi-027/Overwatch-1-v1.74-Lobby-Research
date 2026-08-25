@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-25 (rev 3)
+  Last updated: 2026-08-25 (rev 4)
 ================================================================================
 
 MAIN GOAL
@@ -121,7 +121,10 @@ mistake and remains correct.
     C->S  "HELLO PRO CLIENT\0"                  (17 bytes)
     S->C  "HELLO PRO SERVER\0"                  (17 bytes)
     C->S  [8 bytes padding][32-byte cn]         (40 bytes)
-    S->C  [32-byte srv_rand][1 byte difficulty=0][32-byte sn]
+    S->C  [32-byte srv_rand][1 byte difficulty][32-byte sn]
+          (lobbyserv sends difficulty=0; real servers send 0x07 and 0x09 in
+           the two captures examined. 0 = no proof-of-work required, which
+           the client accepts.)
     C->S  [8 bytes padding][32-byte MAC1]       (40 bytes)
           MAC1 = HMAC-SHA256(ZERO_KEY, cn || sn)
     S->C  MAC2 || JAM(blob)
@@ -144,11 +147,18 @@ mistake and remains correct.
   counter = 0. Encoding 01 00 00 00 is the value 1, not 0 - this exact
   off-by-one silently killed every reply for weeks.
 
-[SOLVED] Wire frame format for server replies.
+[SOLVED] Wire frame format - CORRECTED from real traffic (see Section 2C).
+  Outer framing: [u24be frame_len][u16be msgid][ ... ]
+  The third field is MSGID-DEPENDENT. For some ids it is a u32le payload
+  length (verified 96/96 on retail msgid 0x4401); for others it is a counter.
+  Frames may also be BARE - msgid only, two bytes, no payload at all. The
+  real server's first reply to its client's opening message is exactly that.
+
+  What lobbyserv sent for months instead:
     [u16be msgid][u32le counter][u32le family = 0x11D82194]
-    [u16be bnet-hdr-len][protobuf Header{service_id=0xFE, token, size, status}]
-    [protobuf body]
-  Outer framing: [u24be length][payload]
+    [u16be bnet-hdr-len][protobuf Header{...}][protobuf body]
+  The family id and bnet envelope were assumptions, never confirmed against
+  a real server. See Section 2D.
 
 [SOLVED] Injection chain that survives Arxan.
   bink2w64.dll (proxy) -> loads bink2w64_original.dll + your DLLs.
@@ -190,8 +200,8 @@ mistake and remains correct.
 ################################################################################
 
 LAUNCH (tournament mode - bypasses bnet login, dials the lobby directly)
-    cd /d "Overwatch\_retail_"
-    Overwatch.exe --tank_TournamentMode --lobbyServer=127.0.0.1:3724 --console --tank_logpath "<LOGS FOLDER>"
+    cd /d "<GAME>\Overwatch\_retail_"
+    Overwatch.exe --tank_TournamentMode --lobbyServer=127.0.0.1:3724 --console --tank_logpath "<LOGS>"
 
   START -> ENTER GAME dials 127.0.0.1:3724. No bnet contact in this mode.
   Note: tournament mode locks alt-tab; use Ctrl+Alt+Del to escape.
@@ -317,14 +327,23 @@ INTERPRETATION
 A packet capture of a genuine Overwatch 1 lobby session (retail, client
 192.168.3.44 -> Blizzard 37.244.13.27:3724) was obtained together with a dump
 of the connection's four 64-byte key slots. The client->server direction has
-been FULLY DECRYPTED: 211 frames, 61,712 of 61,712 bytes consumed with zero
-parse errors. This is the first known plaintext of real OW1 lobby traffic.
+been FULLY DECRYPTED: 211 frames, 61,712 of 61,712 bytes, zero parse errors.
+The server->client direction is ALSO fully decrypted: 94 frames, 383,890 of
+383,890 bytes, 100%. This is the first known plaintext of real OW1 lobby
+traffic in either direction.
+
+  The s2c key was contributed by **Zagrion** (OWDev/Prometheus Discord) within
+  hours of this project being published, after he redid the TCP reassembly with
+  tshark. The key had been tried and rejected locally because a hand-rolled
+  scapy reassembly mishandled overlapping retransmits - one byte of
+  misalignment destroys a stream cipher downstream. Use tshark:
+      tshark -r capture.pcap -q -z follow,tcp,raw,0
 
 KEY SCHEDULE - CONFIRMED AGAINST REAL TRAFFIC
     MAC1            = HMAC-SHA256(k0, cn || sn)     (client -> server)
     MAC2            = HMAC-SHA256(k1, sn || cn)     (server -> client)
     c2s cipher key  = HMAC-SHA256(k3, sn || cn)     (JAM key, client->server)
-    s2c cipher key  = NOT YET RECOVERED (k2 expected; see below)
+    s2c cipher key  = HMAC-SHA256(k2, cn || sn)     (JAM key, server->client)
 
   Four separate 64-byte key slots, one role each. In tournament mode all four
   are zero, which is why lobbyserv's ZERO_KEY works locally - but the general
@@ -376,17 +395,93 @@ SAMPLE DECRYPTED FRAMES (real client -> real server)
     [    7] 5000 01070000 00
     [  350] 4401 58010000 ...                                (0x158 = 344 = len-6)
 
-WHY THE SERVER DIRECTION IS STILL ENCRYPTED
-  No HMAC of k0..k3 over the handshake nonces yields valid framing on the
-  server stream. The likely cause is not the key but TCP reassembly: the
-  post-blob segments overlap (offset 406 length 6, then offset 411 length 109 -
-  a one-byte overlap), and a single byte of misalignment destroys a stream
-  cipher's output for everything downstream. Proper overlap-aware reassembly is
-  the next thing to try, then re-test k2 derivations.
+REAL MSGID INVENTORY (server -> client, retail build)
+    0x2800 x8   0x4e0d x4   0x2500 x4   0x4700 x4   0x0003 x4   0x3202 x3
+    0x0e00 x2   0x2a02 x2   0x4d02 x2   0x2e01 x2   0x3101 x2   0x1c14 x2
+    0x2000 x2   0x0002 x1   0x3004 x1   0x3005 x1   0x1c0e x1   0x3000 x1
+    0x1c06 x1   0x1c0c x1   (94 frames total)
 
-  Recovering the server direction is now the single highest-value target in the
-  project: it would show, in real bytes, exactly what a genuine lobby server
-  replies - which is precisely the unknown that has blocked every attempt.
+THE OPENING EXCHANGE, CHRONOLOGICAL (this is the money shot)
+    C->S  [  334] msgid 0x0000    client opening message
+    S->C  [    2] msgid 0x0002    BARE FRAME - msgid only, ZERO payload
+    C->S  [  730] msgid 0x1200    client proceeds
+    S->C  [  106] msgid 0x3004
+    C->S  [    5] msgid 0x1209
+    C->S  [   22] msgid 0x1502
+    S->C  [21162] msgid 0x3005    (large - map/asset manifest?)
+    S->C  [    3] msgid 0x1c0e
+    S->C  [  284] msgid 0x4e0d
+    S->C  [  522] msgid 0x4e0d
+    S->C  [  498] msgid 0x4e0d
+    S->C  [  138] msgid 0x3202
+    S->C  [   64] msgid 0x3202
+    S->C  [   27] msgid 0x3202
+    S->C  [  328] msgid 0x2800
+    S->C  [    6] msgid 0x0e00
+    S->C  [   42] msgid 0x2a02
+
+  The server answers the client's opening message with a BARE TWO-BYTE FRAME.
+  No counter, no family id, no bnet envelope, no protobuf, no body.
+  Note also: when the client later sends its own bare 0x0003, the server
+  sends NOTHING in reply.
+
+WHY THIS STILL DOES NOT SOLVE THE 1.74 BLOCKER (important - read this)
+  The retail capture CANNOT tell us what to reply to the 1.74 client, and this
+  has been checked directly rather than assumed:
+    - The 1.74 family id 0x11D82194 appears ZERO times in the retail capture -
+      not in plaintext, not even in the raw ciphertext, in either direction.
+    - There is NO 10-byte client frame anywhere in 211 retail frames. The
+      1.74 client's 10-byte opening does not exist in retail traffic.
+  Retail and 1.74 QA-dev use different message pools. Tournament mode appears
+  to use a different opening exchange entirely, and it was an internal QA path
+  that was probably never captured against a live Blizzard server.
+
+  What the capture IS good for: the key schedule, the frame grammar, proof
+  that bare frames are legitimate, and a complete template of what a working
+  session looks like once the client does advance.
+
+
+################################################################################
+##  SECTION 2D: BARE-FRAME EXPERIMENTS (2026-08-25, post-decryption)
+################################################################################
+
+Knowing the real server answers with a bare two-byte frame, lobbyserv was
+changed to do the same. Retail ids run 0x0100 below this build's for the low
+messages (retail client 0x0000/0x0003 == 1.74 client 0x0100/0x0103), so the
+predicted reply was a bare 0x0102.
+
+RESULT: bare 0x0102 does NOT advance the client. But it produced a NEW and
+useful behaviour - with 0103 left unanswered, the client retries the 0103 poll
+EXACTLY FIVE TIMES and then gives up. That is its natural retry budget, and it
+had never been observed cleanly before because the server was always replying
+to something.
+
+THE RETRY COUNT IS A DISCRIMINATOR
+  Reply with a bare msgid, then stay silent, and count the client's 0103
+  retries before it closes:
+      0 retries -> frame REJECTED; client tore the socket down immediately
+      5 retries -> frame ACCEPTED as structurally valid; client waited out its
+                   full budget still expecting a real answer
+  This is the sharpest signal the project has ever had. Use it.
+
+SCORES SO FAR
+      0x0102  -> 5 retries   (the only value to score above zero)
+      0x0001 .. 0x000B -> 0 retries, every one
+  Sweep of 0x0001..0x04F0 as bare frames, one msgid per connection, was still
+  running at time of writing. Results append to bare_results.txt.
+
+INTERPRETATION - AND THE UNCOMFORTABLE PART
+  0x0102 already scores the MAXIMUM. The client accepts that frame as valid
+  and still does not advance. If nothing else in the sweep beats 5, the
+  conclusion is NOT "wrong msgid" - it is "a bare frame is the wrong SHAPE",
+  i.e. the reply needs a payload and the msgid dimension is already maxed out.
+
+  Supporting this: in the real transcript both kinds exist. The bare 0x0002
+  ack is immediately followed by 0x3004 carrying 106 bytes. The 1.74 client
+  may simply be waiting for the payload-carrying reply, not the ack.
+
+  NEXT EXPERIMENT IF THE SWEEP COMES BACK EMPTY: bare 0x0102 followed by a
+  payload-carrying reply modelled on the retail 0x3004 (106 bytes).
 
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
@@ -629,3 +724,7 @@ Related projects worth reading:
   - overtools - CRC32 string lists, useful for resolving hashed pool names.
 
 Communities: OWDev / Prometheus Discord.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
