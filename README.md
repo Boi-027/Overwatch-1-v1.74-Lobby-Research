@@ -107,7 +107,6 @@ to help with one thing, make it this one.**
 ```
 docs/PROJECT_STATE.txt   full technical state: addresses, findings, dead ends
 server/lobbyserv.py      lobby server - JAM, blob, handshake, experiments
-server/bnetserv.py       local HTTPS stub for the non-tournament login route
 inject/                  bink2w64 proxy, cert injection, in-process observer
 research/cli_dec.bin     decrypted real lobby traffic (client -> server)
 ```
