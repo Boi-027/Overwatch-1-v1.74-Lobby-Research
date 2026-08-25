@@ -7,7 +7,7 @@
 MAIN GOAL
 ----
 Reach the main menu + lootbox screen on a fully local/offline server.
-No gameplay, no matchmaking. Game preservation, own machine, own copy. (We can leave that to iEvE lmao)
+No gameplay, no matchmaking. Game preservation, own machine, own copy. (We can leave the gameplay to iEvE lmao)
 
 CONVENTIONS USED IN THIS DOCUMENT
 ---------------------------------
