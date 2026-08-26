@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-25 (rev 6)
+  Last updated: 2026-08-26 (rev 7)
 ================================================================================
 
 MAIN GOAL
@@ -594,6 +594,62 @@ PRIVACY NOTE FOR THE PUBLIC REPO
   srv_dec.bin contains a real player's BattleTag and account identifiers from
   a 2022 session. Consider redacting or omitting that file, or at minimum
   noting its contents, before publishing.
+
+
+################################################################################
+##  SECTION 2G: TWO-SESSION DIFF - WHAT IS CONSTANT VS SESSION-SPECIFIC
+################################################################################
+
+packets.pcap (AyakaPS/Plasmawatch, client 16390422107773322648) and
+login-enc.pcapng are TWO DIFFERENT real lobby sessions. login-enc could not be
+decrypted (no keys) but its handshake is plaintext and its frame sizes are
+visible, which is enough to separate constant protocol structure from
+per-session data.
+
+THE 292-BYTE BLOB IS SESSION-SPECIFIC, NOT FIXED STRUCTURE
+  Only 1 of 292 blob bytes match across the two sessions (offset 200, and that
+  is coincidence). Concretely:
+      blob[0]    0x8A vs 0x43   (NOT 0x02)
+      blob[1:5]  random vs random   (NOT 7F 00 00 01)
+      blob[255]  0x82 vs 0xA4   (NOT 0xFF)
+  So the real blob is cryptographic material - almost certainly the RSA-wrapped
+  session key exchange. lobbyserv's blob (blob[0]=0x02, 127.0.0.1, blob[255]=
+  0xFF forcing the RSA path to be skipped) is a TOURNAMENT-MODE SHORTCUT that
+  only works because zeroed keys let the client skip validating it. It is NOT
+  the retail protocol. Section 1's blob construction is correct FOR TOURNAMENT
+  MODE only.
+
+DIFFICULTY IS A PER-CONNECTION VALUE
+  0x09 in packets.pcap, 0x07 in login-enc. Confirmed variable = proof-of-work
+  parameter. lobbyserv sends 0, which the client accepts (no work required).
+
+THE PROTOCOL SKELETON IS INVARIANT ACROSS SESSIONS
+  Client packet-size sequence: [17, 40, 40, ~340, ~730, 8, ...]
+      17  HELLO PRO CLIENT
+      40  [8 pad][32 cn]
+      40  [8 pad][32 MAC1]
+     ~340 opening message (337 vs 353 B) - carries msgid 0x0000
+     ~730 second message
+  Server packet-size sequence: [HELLO, 65, 32, 292, 5, ~100, 1300...]
+      65   [srv_rand][difficulty][sn]
+      32   MAC2
+     292   blob
+       5   the BARE ACK frame (2-byte msgid, +3 framing) - present in BOTH
+     ~100  first payload frame (109 B = 0x3004 in packets.pcap)
+
+  Both sessions match this skeleton exactly. Only the CONTENTS differ.
+
+WHAT THIS MEANS FOR THE 1.74 BLOCKER
+  The payload experiment (Section 2E) failed because the retail 0x3004 body was
+  another session's bytes - and this diff confirms essentially EVERYTHING inside
+  a frame is session-specific: the blob, the opening message, the entity
+  handles. There is no "mostly-constant frame with a few fields to swap"; the
+  bodies are built fresh per session from session state the 1.74 client has
+  and the retail capture does not.
+
+  Consequence: a working 1.74 second message cannot be lifted from any retail
+  capture, decrypted or not. It has to be constructed from the 1.74 client's
+  OWN state. That is the schema problem, and it is behind Arxan.
 
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
