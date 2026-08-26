@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-25 (rev 4)
+  Last updated: 2026-08-25 (rev 5)
 ================================================================================
 
 MAIN GOAL
@@ -368,9 +368,15 @@ TRUE SERVER PREAMBLE (byte offsets in the reassembled stream)
 
 FRAME FORMAT
     [u24be frame_len][u16be msgid][ ... ]
-  For msgid 0x4401 the next field is a u32le payload length; verified on 96 of
-  96 such frames. For other msgids the third field is msgid-dependent (it is a
-  counter for some, e.g. 0x5000 increments by 4).
+  The third field is MSGID-DEPENDENT and there is NO general rule.
+  Measured: on client->server 0x4401 frames it is a u32le payload length,
+  96 of 96. On the server->client stream that interpretation holds for only
+  19 of 86 frames; 67 do not follow it. Do not assume a length field.
+  Some msgids use it as a counter (client 0x5000 increments by 4).
+
+  BARE FRAMES ARE NORMAL, not a special case. The retail server sends six
+  two-byte msgid-only frames in one session: 0x0002, 0x2004, and 0x0003 four
+  times. Three-byte frames also occur (0x1c0e02, 0x1c0600).
 
 REAL MSGID INVENTORY (client -> server, retail build)
     0x4401 x96   0x1a13 x94   0x5000 x5    0x0003 x4    0x1502 x2
@@ -483,6 +489,60 @@ INTERPRETATION - AND THE UNCOMFORTABLE PART
   NEXT EXPERIMENT IF THE SWEEP COMES BACK EMPTY: bare 0x0102 followed by a
   payload-carrying reply modelled on the retail 0x3004 (106 bytes).
 
+
+################################################################################
+##  SECTION 2E: THE ACK IS SOLVED, THE FOLLOW-UP IS NOT (2026-08-25)
+################################################################################
+
+BARE MSGID SWEEP - COMPLETE AND CONCLUSIVE
+  Method: reply to the client's 10-byte 0100 with a bare two-byte frame
+  carrying msgid X, then stay silent. Score = number of 0103 retries the
+  client makes before closing.
+      0 retries -> frame rejected, immediate teardown
+      5 retries -> frame accepted as valid; client waits out its full budget
+
+  Swept 0x0001..0x0152 (338 values), one msgid per connection.
+      0x0102  -> 5 retries
+      EVERY OTHER VALUE -> 0 retries
+  0x0102 was re-tested mid-sweep as a positive control and reproduced its
+  score of 5, which validates the harness and the zeros around it.
+
+  >>> THE CORRECT ACK IS A BARE TWO-BYTE FRAME, msgid 0x0102, framed as
+  >>>     00 00 02 01 02
+  >>> No counter, no family id, no bnet envelope, no body.
+  This is the first server->client message the 1.74 client has ever accepted.
+
+PAYLOAD FOLLOW-UP - REJECTED IN EVERY FORM TRIED
+  Method: send the accepted bare 0x0102, then on the client's first poll send
+  a payload-carrying frame using the REAL retail 0x3004 body (104 bytes,
+  verbatim from the decrypted capture), sweeping the follow-up msgid.
+  Candidates: 0x3004 0x3104 0x0104 0x0004 0x3005 0x3105 0x1200 0x1300
+              0x4401 0x4501 0x1a13 0x1b13
+  Result: EVERY candidate collapses the connection at retry #1. Bare ack plus
+  silence gets 5 retries; bare ack plus any payload gets 1. Reproduced on a
+  second full pass.
+
+  Interpretation: the rejection is content- and msgid-independent, so it
+  happens at a framing/validation layer BEFORE msgid dispatch. Note this
+  includes a byte-exact real Blizzard server frame, which means retail frames
+  do not transplant into a 1.74 session - the "borrow from the capture"
+  approach is closed.
+
+ALSO CORRECTED HERE
+  The retail server's follow-up 0x3004 is far above the 0x4F0 dispatcher gate
+  documented in Section 2. That gate therefore does NOT apply to
+  server->client frames as previously assumed.
+
+WHERE THIS LEAVES THE BLOCKER
+  Every dimension reachable without the 1.74 message schema has now been
+  swept: reply msgid (1,264 as a full reply, 338 as a bare frame, 12 as a
+  payload follow-up), body content (empty, captured bgs, variants, real
+  retail body), and frame shape (bnet envelope, bare, payload-carrying).
+  Exactly one thing works and it does not advance the handshake.
+
+  DO NOT BUILD ANOTHER SWEEP. The remaining unknown is the schema itself,
+  which lives in encrypted .rdata behind Arxan.
+
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
 ################################################################################
@@ -564,7 +624,12 @@ Ordered by estimated value.
    (enter with absurd operands, sar ch,0, imul with garbage displacements).
    Individual basic blocks disassemble fine; whole-function views do not.
 
-3. WHAT DOES THE 0103 FRAME ACTUALLY WANT?  <-- THE CENTRAL QUESTION
+3. WHAT IS THE SECOND SERVER MESSAGE?  <-- THE CENTRAL QUESTION
+   The first one is now known: a bare two-byte 0x0102 (see Section 2E). The
+   client accepts it and waits out five 0103 retries expecting more. Nothing
+   sent after it has ever been accepted.
+
+3b. (historical framing) WHAT DOES THE 0103 FRAME ACTUALLY WANT?
    The client sends 0100 (10 bytes: msgid + counter + family) then 0103
    (2 bytes, no counter, no family), then closes unless answered with msgid
    0x003. Everything tried so far - protobuf envelopes with the captured bgs
@@ -724,7 +789,3 @@ Related projects worth reading:
   - overtools - CRC32 string lists, useful for resolving hashed pool names.
 
 Communities: OWDev / Prometheus Discord.
-
-================================================================================
-END OF DOCUMENT
-================================================================================
