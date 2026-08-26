@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-25 (rev 5)
+  Last updated: 2026-08-25 (rev 6)
 ================================================================================
 
 MAIN GOAL
@@ -542,6 +542,58 @@ WHERE THIS LEAVES THE BLOCKER
 
   DO NOT BUILD ANOTHER SWEEP. The remaining unknown is the schema itself,
   which lives in encrypted .rdata behind Arxan.
+
+
+################################################################################
+##  SECTION 2F: INNER PAYLOAD FORMAT - LENGTH-PREFIXED PROTOBUF (2026-08-25)
+################################################################################
+
+Mining the 94 decrypted server frames revealed how message bodies are built.
+This is build-independent structure and should transfer to 1.74.
+
+LENGTH-PREFIXED PROTOBUF SUB-BLOCKS
+    [u32le block_len][protobuf block]   repeated within a frame body
+  356 such blocks were found across the 94 server frames using a strict
+  protobuf validator (rejects field 0, wiretypes 3/4/6, and any block that
+  does not consume exactly). Examples:
+
+    msgid 0x4e0d  len=10   08ce84011001180c2000
+                           -> f1=16974  f2=1  f3=12  f4=0
+    msgid 0x4e0d  len=19   08ce8401100118032094d38cbcd496cda68a01
+    msgid 0x4e0d  len=20   521209707041000200000211ef9d163a00000000
+                           -> f10, len 18
+    msgid 0x4e0d  len=29   2a1b + 27 bytes UTF-8
+                           -> f5 = "<BattleTag>#<digits>"  (a real player name,
+                              decoded from Cyrillic UTF-8; confirms the
+                              protobuf reading is correct and not coincidence)
+
+  So a frame body is NOT one monolithic protobuf. It is a sequence of
+  u32le-length-prefixed protobuf blocks, interleaved with fixed binary fields.
+
+16-BYTE ENTITY HANDLES
+    [u32le id][8 zero bytes][u32le type]
+  The session's primary handle 3fe15a42 00000000 00000000 00000001 occurs 37
+  times - in 23 of 94 server frames AND in 2 client frames, so handles are
+  echoed in both directions. Other observed handles follow the same shape
+  (e.g. 00300600 0000000000000000 00000001).
+
+  This is very likely what a 1.74 reply must carry and what makes a
+  payload frame valid: an entity handle the client is already holding.
+  Compare the failed payload experiment in Section 2E - the retail body was
+  byte-exact but carried ANOTHER session's handles.
+
+FRAME FAMILIES (server -> client)
+    0x4e0d  x4   282/520/496/134 B - identity + account data, richest protobuf
+    0x2800  x8   326-367 B, all start with the same 32 bytes (two handles)
+    0x3202  x3   136/62/25 B
+    0x3005  x1   21162 B - array: [u32le 56][8-byte records, index 02,03,04...]
+                  roughly 2,600 entries. Map/asset manifest.
+    0x3004  x1   106 B - the follow-up to the bare ack
+
+PRIVACY NOTE FOR THE PUBLIC REPO
+  srv_dec.bin contains a real player's BattleTag and account identifiers from
+  a 2022 session. Consider redacting or omitting that file, or at minimum
+  noting its contents, before publishing.
 
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
