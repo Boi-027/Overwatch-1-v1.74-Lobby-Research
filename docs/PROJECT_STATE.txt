@@ -815,11 +815,56 @@ NET STATE OF THE BLOCKER after 2E-2K:
   - The gate is an envelope/consume condition we cannot see by reading DATA,
     because it is decrypted LOGIC in the decode/dispatch path.
   - The one instrument that reads that logic (DR breakpoint) is killed by Arxan.
+    v59 CONFIRMED: even a ONE-SHOT arm-then-disarm dies. Game stays up ~2s then
+    crashes with NO hit - so merely having DR0 armed and sitting trips Arxan's
+    DR scan; it does not require sustained presence or a fired breakpoint. v58's
+    single hit was a race Arxan's scan lost that one time. DR hooking is DEAD
+    here, full stop. Next stealth attempt: PAGE_GUARD hook (different mechanism,
+    not a debug register - Arxan's DR scan should not see it).
   - Therefore: the remaining unknown is not obtainable by black-box iteration
     or read-only snapshotting. It needs EITHER (a) a tournament-mode capture
     (same code path, zeroed keys, decryptable) to see a real advancing message
     on the wire, OR (b) someone who can read the decoder statically, OR (c) a
     stealth runtime hook that survives Arxan.
+
+
+################################################################################
+##  SECTION 2L: OUR FRAME IS RECEIVED+DECRYPTED+DECODED (marker scan) 2026-08-27
+################################################################################
+
+owobs v60 (read-only, zero risk) + lobbyserv v139 marker frame settled the fork
+left open by the timeout (2J): is our follow-up frame dropped BEFORE decode, or
+received-but-not-consumed?
+
+METHOD: lobbyserv sends, after the bare 0x0102 ack, a follow-up on channel
+  0x3004 whose body is the 16-byte marker DEADBEEFCAFEF00D5EEDFACE1337C0DE
+  repeated x4 (sent JAM-encrypted). owobs scans writable memory for the
+  PLAINTEXT marker.
+
+RESULT: MARKER FOUND, every connection, in a private RW region (0x40000-sized,
+  prot=PAGE_READWRITE), at a stable offset. Context bytes immediately before
+  the marker payload:
+      ...00 00 00 42 30 04 | deadbeef.... (marker)
+  -> 0x3004 = our msgid, 0x42 = 66 = parsed body length. The client stored our
+  frame in a STRUCTURED decode buffer with msgid and length broken out.
+
+CONCLUSION - the block is DOWNSTREAM of decode:
+  - Our frame is received, JAM-decrypted, and decoded into the client's message
+    buffer with its envelope (msgid+len) parsed. Not dropped at socket/cipher/
+    framing. The "before decode" hypothesis is FALSE.
+  - Yet session status stays 6 and times out (2J). So the decoded message is
+    either (a) not routed to the state-6 handler (dispatch gate), or (b) routed
+    but the handler rejects/ignores it as not-the-awaited-message.
+  - This is the "decoded but not consumed" branch, now confirmed. The remaining
+    unknown is the dispatch/consume condition - which is the decrypted LOGIC the
+    DR hook (2K) could not safely observe.
+
+The receive/decode buffer is a stable RW private region (per-run address, e.g.
+  0x0000004C724C0000 + ~0x3AE25). A page-guard on THIS data page (VirtualProtect
+  works on RW data, unlike the blocked .text pages) would trap the code that
+  READS our decoded frame - i.e. the dispatcher/consumer - giving the return
+  address of the consume path WITHOUT a debug register. This is the stealth
+  hook 2K asked for, now with a concrete target.
 
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
