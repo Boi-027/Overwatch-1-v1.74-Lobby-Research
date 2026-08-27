@@ -781,6 +781,46 @@ METHOD NOTE: session+0x60 verdict watching (v57) is the key instrument - it
   distinguishes "timed out waiting" (flat 5s then 2) from "parsed and rejected"
   (would flip faster / differently). Use it for every future reply attempt.
 
+
+################################################################################
+##  SECTION 2K: HARDWARE-BREAKPOINT HOOK - TRIED, ARXAN CRASHES IT (2026-08-27)
+################################################################################
+
+owobs v58 set a hardware execution breakpoint (DR0) on the dispatcher
+(RVA 0x41DB60) across all game threads, with a VEH handler to log frame args.
+
+RESULT - clean but firm negative:
+  - Arm SUCCEEDED: "armed DR0 on 87 threads (0 failed)", "survived arm",
+    re-armed once more (90 threads). Setting the DR did not immediately trip.
+  - Dispatcher fired ONCE: DISPATCHER hit #1
+        rcx=0x028B4CFA3D30  (heap; likely 'this' - connection/dispatcher obj)
+        rdx=0x00B3BD5BC130  (STACK addr; arg passed on stack, not a heap msg obj)
+        r8 =1  r9=0         (r8 small int: length/count/bool)
+    -> confirms RVA 0x41DB60 is the real dispatcher and is reachable, and rcx
+       is the object to inspect.
+  - Then Arxan's DR anti-debug caught up: a FLOOD of
+        ACCESS_VIOLATION at 00007FF8BE511180  (system-DLL range = Arxan watchdog)
+    repeating until the process died.
+
+CONCLUSION: hardware breakpoints (debug-register writes) are detected by Arxan
+  on the lobby threads and crash the process after ~1 hit. DR-based hooking is
+  NOT viable here for sustained observation. Read-only owobs polling remains
+  safe (never tripped Arxan across dozens of runs); DR/execution observation is
+  not. To watch the decode/dispatch logic we would need a stealthier method
+  (e.g. hypervisor/EPT hook, or a mid-function patch that Arxan's integrity
+  check doesn't cover) - both are large escalations.
+
+NET STATE OF THE BLOCKER after 2E-2K:
+  - The reject is a 5s TIMEOUT at status=6 (2J). Channel/body don't matter (2J).
+  - The gate is an envelope/consume condition we cannot see by reading DATA,
+    because it is decrypted LOGIC in the decode/dispatch path.
+  - The one instrument that reads that logic (DR breakpoint) is killed by Arxan.
+  - Therefore: the remaining unknown is not obtainable by black-box iteration
+    or read-only snapshotting. It needs EITHER (a) a tournament-mode capture
+    (same code path, zeroed keys, decryptable) to see a real advancing message
+    on the wire, OR (b) someone who can read the decoder statically, OR (c) a
+    stealth runtime hook that survives Arxan.
+
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
 ################################################################################
