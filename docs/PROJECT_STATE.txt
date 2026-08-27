@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-26 (rev 7)
+  Last updated: 2026-08-27 (rev 10)
 ================================================================================
 
 MAIN GOAL
@@ -651,6 +651,136 @@ WHAT THIS MEANS FOR THE 1.74 BLOCKER
   capture, decrypted or not. It has to be constructed from the 1.74 client's
   OWN state. That is the schema problem, and it is behind Arxan.
 
+
+################################################################################
+##  SECTION 2H: LIVE .rdata DECRYPT - THE MESSAGE FAMILY TABLE (2026-08-27)
+################################################################################
+
+BREAKTHROUGH. The .rdata that is encrypted at rest (and defeated every static
+pe-sieve dump + IDA) can be captured DECRYPTED by snapshotting it while the
+lobby code is executing. Per the dearxan writeup, Arxan encrypts sensitive
+regions at rest and decrypts on execute; owobs v49 polls the lobby .rdata
+regions every 8ms during a live state-6 connection and dumps them the moment
+they read as decrypted (low entropy + real code pointers).
+
+RESULT: all three target regions decrypted cleanly.
+  vtable_window  ent 4.68, 50 code pointers - and contains the embedded string
+                 "ClientLobbyMessageSystem_C::__LobbyServerConnectionUp".
+                 This is the lobby message system's own vtable/handler table.
+  family_reg     ent 2.46, 36 code pointers - the MESSAGE FAMILY TABLE.
+  session_vtbl   ent 5.44, 19 code pointers.
+
+THE MESSAGE FAMILY TABLE (family id 0x11D82194) - decrypted, readable
+  Four registered messages, each an entry keyed by <msgid>_11D82194 with a
+  descriptor pointer:
+      msg 0x01  descriptor @ RVA +0x2CF0120
+      msg 0x02  descriptor @ RVA +0x2CF0180
+      msg 0x03  descriptor @ RVA +0x2CF0030
+      msg 0x04  descriptor @ RVA +0x2CF0080
+  All four share message-base vtable RVA +0x25E1640.
+  The table also cites RVA +0x4A0450 and +0x56CA50 as per-message functions -
+  the same functions Section 3 had marked as constructor / STL-helper. They ARE
+  wired into the message family; they were just unreachable statically because
+  the table pointing at them was encrypted.
+
+WHY THIS MATTERS
+  0x11D82194 is THIS BUILD's family id - the one that appears zero times in the
+  retail capture. Its message set is 0x01..0x04. The client's connect frame is
+  msg 0x01; the reply it wants is one of 0x02..0x04. The descriptor pointers
+  (+0x2CF0120 etc.) define each message's FIELD LAYOUT - i.e. the schema for
+  what a valid reply must contain. This is the exact information that was behind
+  Arxan and is the thing the whole project has been blocked on.
+
+NEXT: snapshot the descriptor regions +0x2CF0030..+0x2CF0180 (same live-dump
+  technique) to read each message's field layout. Then snapshot +0x25E1640
+  (message base vtable) and the handler RVAs +0x7BExxx cited in vtable_window.
+
+METHOD NOTE (reusable): the winning move was dumping .rdata WHILE the code that
+  uses it runs, not at idle. owobs v49 in the repo. Poll fast (8ms), key on
+  entropy<6 + code-pointer count, dump on first decrypted read.
+
+
+################################################################################
+##  SECTION 2I: JamMessage METADATA + FIELD NAMES (2026-08-27)
+################################################################################
+
+Live-decrypt of the message descriptors and the metadata string block gave the
+reply message's actual field structure and the decoder's own error strings.
+
+MESSAGE 0x02 (the reply the client accepts after connect) - FIELD STRUCTURE
+  From descriptor +0x2CF0180, three fields:
+    field 1: type 0x0E, 16 bytes  -> entity handle [u32 id][8 zero][u32 type]
+    field 2: type 0x0E, enum      -> sub-descriptor +0x2CF0380 is an enum table
+                                     (members keyed 0x04,0x08,0x0C,0x10; types 6,6,6,6,7)
+    field 3: repeated/array       -> uses +0x56CA50 (the array/list handler,
+                                     previously mislabelled "STL helper")
+
+JamMessage ENVELOPE FIELD NAMES (plaintext, from metadata block @ +0x2609A00)
+    seq        sequence number
+    src        source
+    _msgID     message id
+    %s-data    (format string for a data field)
+
+  So JamMessages carry seq / src / _msgID metadata. Bare frames supplied none
+  of these named fields, consistent with rejection at the decode/metadata layer.
+
+TWO DECODE PATHS - binary AND json
+  Decoder error strings prove the client can decode a JamMessage as EITHER:
+    - binary  ("... for binary decoding")
+    - json    ("Unable to initialize json decoder", "... for json decoding")
+  selected by a "Protocol Type" ("Invalid Protocol Type"). A JSON decode path
+  may be far easier to construct a valid reply for than the binary wire format.
+  This is a new, unexplored avenue.
+
+  Decoder / dispatch strings for xref: "Unhandled JamMessage, unable to
+  dispatch", "No metadata on JamMessage for binary decoding".
+  Decoder functions cluster at RVA +0x56B2F0, +0x56C430, +0x56CA50, +0x565130.
+
+METHOD: all of the above came from owobs live .rdata snapshots (v49-v52) during
+  a state-6 connection. The regions are Arxan-encrypted at rest; snapshotting
+  while the lobby code executes catches them decrypted.
+
+
+################################################################################
+##  SECTION 2J: THE REJECT IS A TIMEOUT, NOT A PARSE FAILURE (2026-08-27)
+################################################################################
+
+owobs v57 locked onto the real session object (vtbl +0x2616260; the other 44
+vtable-window objects are a different class, +0x2616108) and timestamped its
+verdict field (session+0x60). The result reframes the whole blocker:
+
+  status=6 (awaiting verdict)  at t=345ms
+  status=2 (reject)            at t=5223ms   -- ~5000ms later, EXACTLY
+  ... repeats every connection: 5223, 10495, 16519, 23716, 32325, 45205ms
+      i.e. a precise ~5.0s dwell at status=6 then flip to 2.
+
+THE reject is a 5-SECOND TIMEOUT, not a validation of our bytes. The client
+reaches status=6 (handshake complete, awaiting the next server message that
+advances the lobby), waits 5s, does not get what it wants, and times out to
+status=2. Every "retries=1" / "retries=5" we measured was this same timeout
+window, not a content judgement.
+
+CONSEQUENCE - this changes the problem:
+  - Our 0x0102 replies are not being "rejected on content". They are simply not
+    being consumed as the message that advances state 6. The client sits
+    waiting and times out.
+  - So the follow-up the client wants is very likely NOT another 0x01xx frame.
+    In the real server stream the message that advanced the client after the
+    bare 0x0002 ack was 0x3004 - a DIFFERENT channel. The advancing message is
+    probably in a different family (0x30xx / 0x1c / 0x4e), not 0x02.
+  - The bare 0x0102 ack was still correct (it is what the client accepted at the
+    2-byte stage). The missing piece is the SECOND server message, and it is a
+    different channel than we have been sweeping.
+
+NEXT: after the bare 0x0102 ack, send a 0x3004-channel message (the real
+  server's actual follow-up), then the other observed families, and watch
+  session+0x60 with v57. If status goes 6->7 (accept) or dwells differently
+  than the flat 5s timeout, that channel is the one.
+
+METHOD NOTE: session+0x60 verdict watching (v57) is the key instrument - it
+  distinguishes "timed out waiting" (flat 5s then 2) from "parsed and rejected"
+  (would flip faster / differently). Use it for every future reply attempt.
+
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
 ################################################################################
@@ -897,3 +1027,7 @@ Related projects worth reading:
   - overtools - CRC32 string lists, useful for resolving hashed pool names.
 
 Communities: OWDev / Prometheus Discord.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
