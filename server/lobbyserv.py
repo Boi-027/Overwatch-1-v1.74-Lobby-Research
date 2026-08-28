@@ -1,5 +1,4 @@
-# lobbyserv.py — OW 1.74 lobby server, v131
-
+# lobbyserv.py — OW 1.74 lobby server, v145
 import socket, os, hmac, hashlib, struct, time, sys
 # ============================ HELPER FUNCTIONS =============================
 def varint(v):
@@ -28,7 +27,7 @@ ORIG_KEY_LO = 0x64A7102E
 # "both" | "f1" | "f9"
 KEY_SOURCE = "both"
 
-PENDING_KEY_FILE = r"CHANGE TO YOUR DESIRED PATH"
+PENDING_KEY_FILE = r"WHATEVER PATH YOU WANT"
 
 def _tag(f, wt): return varint((f << 3) | wt)
 def _ld(f, data): return _tag(f, 2) + varint(len(data)) + data
@@ -79,6 +78,244 @@ def build_response_record(msgid, counter, envelope):
     return msgid.to_bytes(2, "big") + counter.to_bytes(4, "little") + FAMILY_ID.to_bytes(4, "little") + envelope
 
 TYPE2_REPLY_PAYLOAD = bytes.fromhex("0102010000009421d811")
+
+
+
+
+
+
+
+# ---- IMMEDIATE FOLLOW-UP (v140) ------------------------------------------
+# Retail server sends bare ack + 0x3004 BACK-TO-BACK (offsets 292,297 in the
+# stream). Our lobbyserv was WAITING for the client's 0x0103 poll before
+# sending the follow-up — wrong. The 0x0103 is a "still waiting" timeout
+# signal that comes AFTER the server should have already sent its burst.
+# v140: send ack + follow-up in the SAME TCP write, no waiting.
+IMMEDIATE_FOLLOWUP = False
+
+# ---- RESPONSE SWEEP (v144) -----------------------------------------------
+# The client polls 0x0103 waiting for the RESPONSE to its 0x0100 connect.
+# Success() advances the session but the poll loop is independent. We need to
+# answer with the correct response message. Try candidates one per poll.
+RESPONSE_SWEEP = True
+RESP_MSGID = 0x0104
+RESP_CANDIDATES = [0x0104, 0x0102, 0x0200, 0x0201, 0x0202, 0x0203, 0x0204]
+
+import struct as _st
+_handle = _st.pack('<I',1) + b'\x00'*8 + _st.pack('<I',1)
+SCHEMA_BODY = _st.pack('<I',1) + _handle + b'\x00'*12 + _st.pack('<I',6) + _st.pack('<I',0)
+
+RESP_0104_BODIES = [
+    ("empty",        b""),
+    ("echo-connect", bytes.fromhex("010000009421d811")),
+    ("family-only",  bytes.fromhex("9421d811")),
+    ("seq-only",     bytes.fromhex("01000000")),
+    ("seq+family",   bytes.fromhex("010000009421d811")),
+    ("zero4",        bytes.fromhex("00000000")),
+    ("schema",       SCHEMA_BODY),
+]
+
+BODY_VARIANTS = [
+    b"",                                                    # 0: bare, no body
+    bytes.fromhex("010000009421d811"),                     # 1: echo client's connect body
+    bytes.fromhex("9421d811"),                             # 2: just family ID
+    bytes.fromhex("01000000"),                             # 3: just seq
+    bytes.fromhex("02000000"),                             # 4: seq=2
+    bytes.fromhex("010000009421d811") + SCHEMA_BODY,       # 5: family echo + schema
+    bytes.fromhex("020000009421d811") + SCHEMA_BODY,       # 6: seq=2 + family + schema
+    SCHEMA_BODY,                                            # 7: plain schema (retry)
+]
+BODY_STATE_FILE = "body_variant_state.txt"
+def body_variant_load():
+    try:
+        with open(BODY_STATE_FILE) as f: return int(f.readline().strip())
+    except: return 0
+def body_variant_save(v):
+    with open(BODY_STATE_FILE,"w") as f: f.write(str(v))
+def next_body_variant():
+    i = body_variant_load() % len(BODY_VARIANTS)
+    body_variant_save(i+1)
+    return i, BODY_VARIANTS[i]
+
+# Schema-informed msg 0x02 body: [u32 seq=1][16B handle][12B zero][u32 kind=6][u32 0]
+
+
+HOLD_CONNECTION = True
+
+# ---- MARKER FRAME (v139): find where the client stores our decrypted frame ---
+MARKER_ENABLED = False
+MARKER_HEX = "DEADBEEFCAFEF00D5EEDFACE1337C0DE"
+def build_marker_frame():
+    # real 0x3004 channel, body = marker repeated so it's easy to spot + long
+    body = bytes.fromhex(MARKER_HEX) * 4        # 64 bytes of marker
+    p = (0x3004).to_bytes(2,"big") + body
+    return len(p).to_bytes(3,"big") + p
+
+# ---- FOLLOW-UP CHANNEL SWEEP (v138) --------------------------------------
+# v57 proved the reject is a 5s TIMEOUT: the client waits at status=6 for a
+# message that advances the lobby and never gets it. The real server advanced
+# the client with 0x3004 (a different channel), not 0x02. Sweep the follow-up
+# channel using the REAL retail 0x3004 body as-is, one channel per connection.
+FOLLOWUP_ENABLED = False
+FOLLOWUP_STATE = "followup_state.txt"
+# the real 0x3004 body, verbatim from decrypted retail traffic
+REAL_3004 = bytes.fromhex(
+    "04000000000000000000000098edbfd6d8d92c40fe92aaa083b6936d638ff117fdfcc43"
+    "04000000062d90efa7f36d71c398ae2f1fe37bdb9aeb0eadea47612fe6c041a03958df2"
+    "41706faf95a85cb238c86735f85b0f6fc75e4f0d15c93a989f53a59c83f195d44b")
+# candidate follow-up msgids to try after the bare ack (real server used 0x3004)
+FOLLOWUP_MSGIDS = [0x3004, 0x3104, 0x3005, 0x3105, 0x1c0e, 0x4e0d, 0x2800,
+                   0x1200, 0x0104, 0x0204, 0x3000, 0x3200]
+
+def followup_load():
+    try:
+        with open(FOLLOWUP_STATE) as f: return int(f.readline().strip(),0)
+    except (FileNotFoundError, OSError, ValueError): return 0
+def followup_save(v):
+    try:
+        with open(FOLLOWUP_STATE,"w") as f: f.write(str(v))
+    except OSError: pass
+def next_followup():
+    i = followup_load() % len(FOLLOWUP_MSGIDS)
+    followup_save((i+1) % len(FOLLOWUP_MSGIDS))
+    return FOLLOWUP_MSGIDS[i]
+def build_followup_frame(msgid, body):
+    p = msgid.to_bytes(2,"big") + body
+    return len(p).to_bytes(3,"big") + p
+
+# ---------------------------- SCHEMA-INFORMED 0x02 REPLY -------------------
+# Built from the live-decrypted message descriptor (Section 2H/2I):
+#   msg 0x02 fields: [16-byte entity handle][enum u32][repeated array]
+#   envelope carries seq/src/_msgID metadata.
+# Template comes from the real server's 0x4e0d frame, which lays out the
+# handle in exactly the descriptor's [u32 id][8 zero][u32 type] form.
+SCHEMA_REPLY_ENABLED = False
+
+# a handle to advertise. The client must recognize it; we start with the
+# session-local form and also try the retail primary as a control.
+REPLY_HANDLE_ID   = 0x00000001      # low id; the client's own session handle
+REPLY_HANDLE_TYPE = 0x00000001
+
+def build_handle(hid, htype):
+    return struct.pack('<I', hid) + b'\x00'*8 + struct.pack('<I', htype)
+
+def pb_block(*fields):
+    """encode a protobuf block from (field_num, wiretype, value) tuples."""
+    out = b""
+    for fn, wt, val in fields:
+        out += bytes([(fn << 3) | wt])
+        if wt == 0:
+            v = val
+            while True:
+                b = v & 0x7F; v >>= 7
+                out += bytes([b | (0x80 if v else 0)])
+                if not v: break
+        elif wt == 2:
+            out += bytes([len(val)]) + val
+    return out
+
+def lp_block(blk):
+    """length-prefixed block: [u32le len][block]."""
+    return struct.pack('<I', len(blk)) + blk
+
+def build_msg02_body(seq=1, handle=None, kind=6, blocks=None):
+    """msg 0x02 body, layout mirrored from the real 0x4e0d frame:
+       [u32 leading][16B handle][3x u32 zero][u32 kind][u32 0]
+       then array of [u32le len][protobuf block]."""
+    if handle is None:
+        handle = build_handle(REPLY_HANDLE_ID, REPLY_HANDLE_TYPE)
+    body  = struct.pack('<I', seq)
+    body += handle
+    body += b'\x00' * 12                 # +0x14..0x1F: three reserved u32
+    body += struct.pack('<I', kind)      # +0x24: kind/type field (=6 in 0x4e0d)
+    body += struct.pack('<I', 0)         # +0x28
+    if blocks is None:
+        # one minimal protobuf block like the real frame's first:
+        # f1=varint 16974, f2=1, f3=varint 12, f4=0  (08 ce8401 1001 180c 2000)
+        blocks = [ pb_block((1,0,16974),(2,0,1),(3,0,12),(4,0,0)) ]
+    for blk in blocks:
+        body += lp_block(blk)
+    return body
+
+def build_msg02_frame(seq=1):
+    body = build_msg02_body(seq=seq)
+    payload = b'\x01\x02' + body           # msgid 0x0102 (this build's numbering)
+    return len(payload).to_bytes(3, 'big') + payload
+
+# ---------------------------- PAYLOAD FOLLOW-UP ----------------------------
+PAYLOAD_ENABLED = False
+PAYLOAD_STATE   = "payload_state.txt"
+
+# captured verbatim from real Blizzard traffic: the 0x3004 frame the retail
+# server sent immediately after its bare 0x0002 ack
+RETAIL_3004_BODY = bytes.fromhex(
+    "04000000000000000000000098edbfd6d8d92c40fe92aaa083b6936d638ff117fdfcc43"
+    "04000000062d90efa7f36d71c398ae2f1fe37bdb9aeb0eadea47612fe6c041a03958df2"
+    "41706faf95a85cb238c86735f85b0f6fc75e4f0d15c93a989f53a59c83f195d44b"
+)
+
+PAYLOAD_CANDIDATES = [0x3004, 0x3104, 0x0104, 0x0004, 0x3005, 0x3105,
+                      0x1200, 0x1300, 0x4401, 0x4501, 0x1a13, 0x1b13]
+
+def payload_load():
+    try:
+        with open(PAYLOAD_STATE) as f:
+            return int(f.readline().strip(), 0)
+    except (FileNotFoundError, OSError, ValueError):
+        return 0
+
+def payload_save(v):
+    try:
+        with open(PAYLOAD_STATE, "w") as f:
+            f.write(str(v))
+    except OSError:
+        pass
+
+def next_payload():
+    i = payload_load() % len(PAYLOAD_CANDIDATES)
+    payload_save((i + 1) % len(PAYLOAD_CANDIDATES))
+    return PAYLOAD_CANDIDATES[i]
+
+def build_payload_frame(msgid, body):
+    p = msgid.to_bytes(2, "big") + body
+    return len(p).to_bytes(3, "big") + p
+
+# ---------------------------- BARE MSGID SWEEP -----------------------------
+BARE_SWEEP_ENABLED = False
+BARE_LO    = 0x0001
+BARE_HI    = 0x04F0
+BARE_STATE = "bare_state.txt"
+
+def bare_load():
+    try:
+        with open(BARE_STATE) as f:
+            v = int(f.readline().strip(), 0)
+        if BARE_LO <= v <= BARE_HI:
+            return v
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    return BARE_LO
+
+def bare_save(v):
+    try:
+        with open(BARE_STATE, "w") as f:
+            f.write("0x%04X" % v)
+    except OSError:
+        pass
+
+def next_bare():
+    v = bare_load()
+    bare_save(v + 1 if v < BARE_HI else BARE_LO)
+    return v
+
+# ---------------------------- REAL-TRAFFIC REPLY ---------------------------
+BARE_ACK_ENABLED = True
+BARE_ACK_MSGID   = 0x0102   # uniquely accepted; confirmed twice
+ANSWER_0103      = False
+
+def build_bare_frame(msgid):
+    payload = msgid.to_bytes(2, "big")
+    return len(payload).to_bytes(3, "big") + payload
 
 # ============================ JAM CIPHER ====================================
 HELLO_CLIENT = b"HELLO PRO CLIENT\x00"
@@ -277,7 +514,7 @@ def next_msgid():
 
 
 # ---------------------------- SHORT REPLY SWEEP ----------------------------
-SHORT_REPLY_ENABLED = True
+SHORT_REPLY_ENABLED = False
 SHORT_LO    = 0x00
 SHORT_HI    = 0xFF
 SHORT_STATE = "short_state.txt"
@@ -305,7 +542,7 @@ def next_short():
     return v
 
 # ---------------------------- BODY VARIANTS --------------------------------
-BODY_SWEEP_ENABLED = True
+BODY_SWEEP_ENABLED = False
 BODY_STATE = "body_state.txt"
 
 def body_variants():
@@ -421,6 +658,19 @@ def handle(c, addr):
     post_reply_frames = 0
     repeat_replies = 0
     last_probe = 0
+    last_bare = 0
+    retries = 0
+    conn_bare = next_bare() if BARE_SWEEP_ENABLED else BARE_ACK_MSGID
+    conn_payload = next_payload() if PAYLOAD_ENABLED else 0
+    conn_body_variant = next_body_variant() if RESPONSE_SWEEP else (0, b"")
+    if RESPONSE_SWEEP:
+        print(f"[lobby] *** body variant #{conn_body_variant[0]} for this connection ***")
+    conn_followup = next_followup() if FOLLOWUP_ENABLED else 0
+    if FOLLOWUP_ENABLED:
+        print(f"[lobby] *** this connection follow-up = 0x{conn_followup:04X} ***")
+    if PAYLOAD_ENABLED:
+        print(f"[lobby] *** bare 0x{conn_bare:04X} then payload 0x{conn_payload:04X} ***")
+    print(f"[lobby] *** this connection tests bare msgid 0x{conn_bare:04X} ***")
     cur_variant = ("captured_bgs", 0)
     cur_body = b""
     t_reply = None
@@ -448,6 +698,7 @@ def handle(c, addr):
                 dec_buf = dec_buf[3+ln:]
                 print(f"[lobby] <<< CLIENT FRAME ({ln} bytes): {frame.hex()}")
                 if frame.hex() != "0103" and frame[:2] != b"\x01\x00":
+                    print(f"[lobby] ### last bare msgid sent = 0x{last_bare:04X}")
                     print(f"[lobby] ############################################")
                     print(f"[lobby] ### NON-0103 FRAME: {frame.hex()}")
                     print(f"[lobby] ### last probe msgid = 0x{last_probe:03X}")
@@ -461,9 +712,46 @@ def handle(c, addr):
 
                 if frame[:2] == b"\x01\x00" and not acked:
                     acked = True
-                    reply = len(TYPE2_REPLY_PAYLOAD).to_bytes(3, "big") + TYPE2_REPLY_PAYLOAD
-                    c.sendall(txjam.crypt(reply))
-                    print("[lobby] >>> sent 0102 ACK")
+                    if BARE_ACK_ENABLED:
+                        mid = conn_bare
+                        last_bare = mid
+                        ack_frame = build_bare_frame(mid)
+                        if IMMEDIATE_FOLLOWUP:
+                            fu_body = REAL_3004
+                            fu_payload = (0x3004).to_bytes(2,"big") + fu_body
+                            fu_frame = len(fu_payload).to_bytes(3,"big") + fu_payload
+                            burst = txjam.crypt(ack_frame) + txjam.crypt(fu_frame)
+                            c.sendall(burst)
+                            print(f"[lobby] >>> BARE ack 0x{mid:04X} + IMMEDIATE 0x3004 ({len(fu_frame)}B) in ONE burst")
+                        else:
+                            c.sendall(txjam.crypt(ack_frame))
+                            print(f"[lobby] >>> BARE msgid=0x{mid:04X}")
+                    else:
+                        reply = len(TYPE2_REPLY_PAYLOAD).to_bytes(3, "big") + TYPE2_REPLY_PAYLOAD
+                        c.sendall(txjam.crypt(reply))
+                        print("[lobby] >>> sent 10-byte 0102 ACK (legacy)")
+                    continue
+
+                if frame.hex() == "0103" and not ANSWER_0103:
+                    retries += 1
+                    # Keepalive for first 3 polls so owobs Success() can fire and
+                    # set status=7. Then send one response candidate per poll.
+                    if retries <= 3:
+                        ka = build_bare_frame(0x0003)
+                        c.sendall(txjam.crypt(ka))
+                        print(f"[lobby] <<< 0103 retry #{retries} >>> keepalive 0x0003 (holding)")
+                    else:
+                        idx = retries - 4
+                        if idx < len(RESP_0104_BODIES):
+                            label, body = RESP_0104_BODIES[idx]
+                            p = (0x0104).to_bytes(2,"big") + body
+                            fr = len(p).to_bytes(3,"big") + p
+                            c.sendall(txjam.crypt(fr))
+                            print(f"[lobby] <<< 0103 retry #{retries} >>> 0x0104 [{label}] ({len(body)}B body)")
+                        else:
+                            ka = build_bare_frame(0x0003)
+                            c.sendall(txjam.crypt(ka))
+                            print(f"[lobby] <<< 0103 retry #{retries} >>> keepalive (bodies exhausted)")
                     continue
 
                 if frame.hex() == "0103":
@@ -523,7 +811,12 @@ def handle(c, addr):
                         f.write(f"0x{reply_msgid:03X} held={held:.2f} "
                                 f"frames={post_reply_frames}\n")
             else:
-                print(f"[lobby] client closed. msgid=0x{reply_msgid:03X} (no reply sent)")
+                print(f"[lobby] client closed. bare=0x{conn_bare:04X} retries={retries}")
+                with open("payload_results.txt", "a") as bf:
+                    bf.write(f"bare=0x{conn_bare:04X} payload=0x{conn_payload:04X} "
+                             f"retries={retries}\n")
+                if retries >= 5:
+                    print(f"[lobby] *** 0x{conn_bare:04X} SCORED {retries} — accepted as valid ***")
             return
         if time.time() - t0 > 300:
             print("[lobby] 300s silence"); return
@@ -545,6 +838,25 @@ def main():
     assert b.crypt(a.crypt(bytes(range(256)))) == bytes(range(256))
     assert build_body(ORIG_KEY_HI, ORIG_KEY_LO) == HARDCODED_BODY, "body rebuild mismatch"
     print(f"[lobby] self-check OK (v130: body rebuild byte-exact, KEY_SOURCE={KEY_SOURCE})")
+    if FOLLOWUP_ENABLED:
+        print(f"[lobby] FOLLOWUP SWEEP ON: after bare ack, one of "
+              f"{len(FOLLOWUP_MSGIDS)} channels with the real 0x3004 body; "
+              f"watch session+0x60 via owobs v57")
+    if SCHEMA_REPLY_ENABLED:
+        _t = build_msg02_frame()
+        print(f"[lobby] SCHEMA 0x02 REPLY ON: {len(_t)}B frame "
+              f"= 0x4e0d-mirrored layout (handle + kind + protobuf-block array)")
+    if PAYLOAD_ENABLED:
+        print(f"[lobby] PAYLOAD FOLLOW-UP: bare 0x{BARE_ACK_MSGID:04X} then one of "
+              f"{len(PAYLOAD_CANDIDATES)} candidate msgids with the retail 0x3004 body")
+        print(f"[lobby] results -> payload_results.txt")
+    if BARE_SWEEP_ENABLED:
+        print(f"[lobby] BARE MSGID SWEEP: 0x{BARE_LO:04X}..0x{BARE_HI:04X}, "
+              f"resuming at 0x{bare_load():04X}  (~6 per connection)")
+        print(f"[lobby] one msgid per connection, silent on polls")
+        print(f"[lobby] scores -> bare_results.txt ; non-0103 frames -> probe_hits.txt")
+    else:
+        print(f"[lobby] BARE ACK fixed at msgid 0x{BARE_ACK_MSGID:04X}")
     if not SWEEP_ENABLED:
         print(f"[lobby] keepalive msgid pinned to 0x{FIXED_MSGID:03X}")
     if BODY_SWEEP_ENABLED:
