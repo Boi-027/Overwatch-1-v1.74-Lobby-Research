@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-27 (rev 10)
+  Last updated: 2026-08-27 (rev 11)
 ================================================================================
 
 MAIN GOAL
@@ -332,7 +332,7 @@ The server->client direction is ALSO fully decrypted: 94 frames, 383,890 of
 383,890 bytes, 100%. This is the first known plaintext of real OW1 lobby
 traffic in either direction.
 
-  The s2c key was contributed by **Zagrion** (AyakaPS Discord) within
+  The s2c key was contributed by **Zagrion** (OWDev/Prometheus Discord) within
   hours of this project being published, after he redid the TCP reassembly with
   tshark. The key had been tried and rejected locally because a hand-rolled
   scapy reassembly mishandled overlapping retransmits - one byte of
@@ -865,6 +865,61 @@ The receive/decode buffer is a stable RW private region (per-run address, e.g.
   READS our decoded frame - i.e. the dispatcher/consumer - giving the return
   address of the consume path WITHOUT a debug register. This is the stealth
   hook 2K asked for, now with a concrete target.
+
+
+################################################################################
+##  SECTION 2M: BREAKTHROUGH - CLIENT ADVANCED PAST THE LOBBY WALL (2026-08-27)
+################################################################################
+
+Biggest result of the project. We got the 1.74 client to advance past the lobby
+wall for the first time in a decade of attempts.
+
+THE TIMEOUT IS ADVANCED BY Success() @ RVA 0xE38600
+  - Success() is NOT Arxan-encrypted (first bytes 48 83 c1 f0 = add rcx,-0x10,
+    a normal prologue) and can be CALLED directly from owobs with the session
+    object as 'this' (rcx). It returns cleanly and sets session+0x60 = 7.
+  - owobs v66 first wrote status=7 directly (worked, held). v69 CALLS Success()
+    properly (does the real init, not just the field write).
+  - RESULT: the client screen changed from the retry/stop/retry loop to
+    CONTINUOUS "ENTERING GAME" loading. It advanced past the wall.
+
+BUT: status/verdict and the poll loop are TWO INDEPENDENT SUBSYSTEMS.
+  - Success() advances the session verdict (status 6->7).
+  - The client ALSO runs a 0x0103 poll loop waiting for the actual response
+    message. That loop is separate - Success() does not satisfy it.
+  - So the client sits at "ENTERING GAME" (verdict accepted) but never fully
+    proceeds (poll loop unsatisfied).
+
+CONNECTION-HOLDING SOLVED
+  - Silent polls -> client closes after 5 retries. Responding to every 0x0103
+    with a bare 0x0003 keepalive holds the connection OPEN indefinitely
+    (tested 36+ retries). This gives Success() time to fire on a live socket.
+
+THE REMAINING WALL: the poll wants a RESPONSE we can't yet form
+  - Sending ANY content frame as a poll response (0x0104 empty, 0x0104+body,
+    0x3004, schema body, etc.) -> client closes IMMEDIATELY. Even 0x0104 with an
+    EMPTY body closes it. Keepalives (0x0003) never close it.
+  - So the client rejects the content frame itself, not just a bad body.
+    Leading theory: JAM cipher COUNTER DESYNC. The cipher is a stream (counter
+    advances per byte). Keepalives stay in sync, but a content frame the client
+    tries to DECODE surfaces the desync as a garbage body -> close.
+
+RETAIL GROUND TRUTH (from Zagrion's decoded capture + our streams)
+  Server: 0x0002(ack) -> 0x3004 -> 0x3005 -> 0x1c0e -> 0x4e0d
+  Client: 0x0000(connect) -> 0x1200 -> 0x1209 -> 0x1502 -> 0x5000 -> 0x4401...
+  - After the bare ack, the retail CLIENT proceeds to 0x1200 on its own; its
+    first 0x0003 poll is only frame #8. Our 1.74 client polls from the start
+    and never proceeds to 0x12xx.
+  - The server's 0x3004 (right after ack) is likely what unblocks the client.
+    We can't yet deliver it without the client closing (cipher desync theory).
+
+NEXT:
+  - Ask Zagrion the cipher-state question: after the bare ack, when the server
+    sends 0x3004, is the s2c cipher counter continuous across frames or reset
+    per-frame? His capture answers this directly.
+  - Test counter=0 reset vs continuous on the follow-up ourselves.
+  - Key files: owobs v69 (calls Success), lobbyserv (bare ack + keepalive holds
+    connection; content-frame-on-poll still closes).
 
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
