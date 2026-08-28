@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-27 (rev 11)
+  Last updated: 2026-08-27 (rev 13)
 ================================================================================
 
 MAIN GOAL
@@ -332,7 +332,7 @@ The server->client direction is ALSO fully decrypted: 94 frames, 383,890 of
 383,890 bytes, 100%. This is the first known plaintext of real OW1 lobby
 traffic in either direction.
 
-  The s2c key was contributed by **Zagrion** (AyakaPS Discord Server) within
+  The s2c key was contributed by **Zagrion** (AyakaPS Discrd) within
   hours of this project being published, after he redid the TCP reassembly with
   tshark. The key had been tried and rejected locally because a hand-rolled
   scapy reassembly mishandled overlapping retransmits - one byte of
@@ -920,6 +920,101 @@ NEXT:
   - Test counter=0 reset vs continuous on the follow-up ourselves.
   - Key files: owobs v69 (calls Success), lobbyserv (bare ack + keepalive holds
     connection; content-frame-on-poll still closes).
+
+
+################################################################################
+##  SECTION 2N: HANDLE-IN-BODY THEORY TESTED, DOES NOT PAN OUT (2026-08-27)
+################################################################################
+
+After 2M (Success() advances the verdict but the poll loop still wants the real
+second message), the theory was: the 0x3004 follow-up decodes fine (2L) but
+carries the wrong entity handle, so the client ignores it. msg 0x02 field 1 is a
+16-byte handle [u32 id][8 zero][u32 type] the client must recognize.
+
+owobs v70/v71 scanned the session object for that shape and found one candidate
+at session+0x54. It is NOT a real handle:
+  - the "type" dword read 1, then 6, then 5 on successive runs. A real entity
+    type is stable; a value that changes every run is just transient bytes at
+    session+0x58 coincidentally matching the pattern.
+  - feeding it into the 0x3004 body changed nothing: same close at retry #4.
+CONCLUSION: the session object does NOT hold a usable entity handle at +0x54;
+  the real handle is not sitting plainly in the session object. Handle-in-body
+  theory is not disproven in general, but we have no valid handle to test it
+  with, and the obvious location does not have one.
+
+USEFUL BYPRODUCT - the POPULATED session object (v71, once cn is nonzero):
+  +0x170 "127.0.0.1:3724"  (the lobby server address, ASCII)
+  +0x1A0 cn = 32 bytes real random   (client nonce, live-readable)
+  +0x1C0 sn = read as zero here (likely not the sn's real storage; handshake
+             still completes, so sn is used correctly internally)
+  Early (unpopulated) dumps show all zeros - always wait for cn!=0 before
+  reading session fields.
+
+INSTANCE SERVER RULED OUT AS THE NEXT STEP:
+  With Success() forcing the accept, a passive listener on :3725/:3726 saw NO
+  connection. The client does not dial an instance/game server from the
+  "ENTERING GAME" state. It is still waiting on the LOBBY connection for the
+  second message. The block is in the lobby, not downstream.
+
+0x3004 TIMING NUANCE (worth noting):
+  - 0x3004 sent as the IMMEDIATE follow-up right after the ack -> decodes,
+    stays connected, times out at 5s (2L path).
+  - 0x3004 sent as a poll response AFTER keepalives -> client closes at retry
+    #4 immediately.
+  So position in the stream matters; sending content after keepalives behaves
+  differently from sending it immediately. (Cause not yet isolated - possibly
+  the keepalives, possibly just that the immediate one is what retail does.)
+
+NET: every runtime avenue safely reachable is explored. The remaining unknown -
+  what message content stops the poll loop and makes the client proceed to
+  0x1200 like retail - is in decode/dispatch logic we cannot safely observe
+  (DR hooks crash 2K; the scratch buffer is abandoned after decode 2L). The
+  unblock now depends on Zagrion's decoded-capture answer or a tournament-mode
+  capture, not more black-box iteration.
+
+
+################################################################################
+##  SECTION 2O: STATUS vs STATE ARE SEPARATE; STATE NEEDS THE REAL MSG (2026-08-27)
+################################################################################
+
+Post-Success() investigation (owobs v74/v75) clarified WHY the Success() shim
+advances the client to "ENTERING GAME" but no further.
+
+v74 - after Success() sets status=7, watched the whole session object:
+  - status held 7, but STATE (+0x70) stayed 6.
+  - a repeating ~50-150ms loop at session+0x288/+0x28C/+0x290:
+        +0x288 FFFFFFFF<->FFFFFFFE   +0x28C 0<->1   +0x290 0<->0x4020
+    the client is actively polling/staging something and clearing it - a
+    post-accept wait loop, not an idle stall.
+  - one-time +0x2CC: 00000101 -> 00000100 right after Success().
+
+v75 - called the completion callback 0xE38590 (docs: reads status, 7 -> fire
+  success continuation 0xE39C20). It ran clean but did NOT advance state:
+        Success -> status=7
+        completion 0xE38590 -> status=0 (RESET verdict to waiting), then 1
+        state stayed 6 throughout.
+  So 0xE38590 is a "consume the verdict and resume waiting" function, NOT the
+  state-machine advancer. It reset status 7->0 instead of moving state 6->7.
+
+CONCLUSION - status and state are DIFFERENT axes:
+  - status (+0x60): the verdict on the current wait (2 reject / 7 accept / 0
+    waiting). FORCEABLE via Success(), but transient - the completion callback
+    resets it to 0.
+  - state (+0x70): the overall lobby progression (6 = awaiting the advancing
+    message). NOT driven by the verdict machinery. Nothing we call (Success,
+    completion, continuation) moves it past 6.
+  => state 6->7 is gated on the REAL second message being consumed through the
+     proper decode/dispatch path, not on the verdict field. This is why the
+     Success() shim reaches "ENTERING GAME" (verdict faked) but never completes
+     (state never advances). Forcing the verdict cannot substitute for the
+     message.
+
+NET: confirms the second message is unavoidable - it is what advances state, and
+  the verdict shim cannot stand in for it. Every constructible shape times out
+  (2E,2J,2M,2N + JSON path + connect-mirror, all flat 5s). The message content
+  is decrypted decode/dispatch logic unreachable by safe runtime observation
+  (DR hooks crash 2K). Unblock still requires a tournament capture or static
+  decoder access. Solo black-box iteration on message shape is exhausted.
 
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
