@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-27 (rev 13)
+  Last updated: 2026-08-28 (rev 14)
 ================================================================================
 
 MAIN GOAL
@@ -332,7 +332,7 @@ The server->client direction is ALSO fully decrypted: 94 frames, 383,890 of
 383,890 bytes, 100%. This is the first known plaintext of real OW1 lobby
 traffic in either direction.
 
-  The s2c key was contributed by **Zagrion** (AyakaPS Discrd) within
+  The s2c key was contributed by **Zagrion** (AyakaPS Discord) within
   hours of this project being published, after he redid the TCP reassembly with
   tshark. The key had been tried and rejected locally because a hand-rolled
   scapy reassembly mishandled overlapping retransmits - one byte of
@@ -1015,6 +1015,174 @@ NET: confirms the second message is unavoidable - it is what advances state, and
   is decrypted decode/dispatch logic unreachable by safe runtime observation
   (DR hooks crash 2K). Unblock still requires a tournament capture or static
   decoder access. Solo black-box iteration on message shape is exhausted.
+
+
+################################################################################
+##  SECTION 2P: RETAIL 0x01xx EXCHANGE (frame 35) - DIFFERENT FAMILY (2026-08-28)
+################################################################################
+
+Zagrion pointed at the RETAIL capture around frame 35, where the 0x01xx family
+messages ACTUALLY appear (deep in the session, not at the start). Frames 35-42:
+    C->S  0x0100 len=10    connect (10 bytes! SAME shape as our 1.74 tournament)
+    S->C  0x0101 len=42    small record list (count=3, 12B records)
+    S->C  0x0102 len=898   ★ 898-byte structured message (9 records, ~99B each)
+    S->C  0x0103 len=22    poll
+    S->C  0x010a len=222
+    S->C  0x0106/0x0107    6-byte control frames
+    S->C  0x0104 len=174
+
+★ THE 0x0102 IS NOT A BARE ACK. We have been sending a 2-byte 0x0102 all
+  along. The REAL 0x0102 (in retail) is 898 bytes carrying 9 structured
+  entity records. The client accepted our 2-byte 0x0102 as "structurally
+  valid msgid" (scored 5 retries) but never advanced because it was EMPTY.
+  This is a major reframing: bare 0x0102 = the ack; big 0x0102 = the
+  advancing message the poll loop was waiting for.
+
+BUT ★★★ FAMILY MISMATCH RULES OUT DIRECT REPLAY:
+  Zagrion also decoded the retail 0x0100's family stamp: 0x48CBF320
+  Our 1.74 0x0100 family stamp:                          0x11D82194
+  SAME msgid range (0x01xx), COMPLETELY DIFFERENT SCHEMAS. The retail 898-byte
+  0x0102 is family 0x48CBF320's format; our client expects family 0x11D82194's
+  format. Same msgids, different message structures per family.
+
+  Confirmed empirically: sent the full 898-byte retail 0x0102 body (5 variants:
+  bare-ack-then-0102, 0102-alone, full-sequence, 0101+0102, baseline bare) -
+  ALL flat 5000ms timeout in v57 verdict watch. Retail body does not transplant
+  across family boundaries.
+
+RETAIL 0x0102 RECORD FORMAT (informative, from 898B decode):
+    [u32 count=9][record x9]
+    each record ~99B; recurring type tags: 0x00003006, 0x000003E1, 0x02500000,
+    0x000001B0. These are family 0x48CBF320's entity-type identifiers - they
+    do NOT map to our family 0x11D82194.
+    Retail 0x0101 (40B): [u32 count=3][u32 seq][u16 id=0x03E1][u16 zero]
+      [u16 type=0x0250]... same recurring type tags as 0x0102.
+
+CONCLUSION: retail 0x01xx family (0x48CBF320) is decoded and understood. It
+  does NOT solve our 1.74 family (0x11D82194)'s second-message content, because
+  the entity handles, type tags, and record contents are per-family. Zagrion's
+  find IS however a valuable Rosetta stone for the message SHAPE: our family's
+  0x0102 is very likely also a count-prefixed record list of similar structure,
+  just with our family's own type tags and handles.
+
+################################################################################
+##  SECTION 2Q: FAMILY 0x11D82194 IN LIVE HEAP - REGISTRY FOUND (2026-08-28)
+################################################################################
+
+Hunted for family 0x11D82194 in the client's writable heap memory (owobs v79-
+v83) during state 6, to find its entity-type identifiers or message templates.
+
+FINDINGS:
+  - Family ID lives at ~6-8 heap locations (varies per run based on allocation
+    timing). Log candidates from an 8-hit run (heap addresses shift per run):
+      hit0: registration entry - family + ASCII string "0x11d82194" nearby
+            (an FNV/name lookup entry, the family's registered name)
+      hit2: empty allocated message buffer: [0001000A][seq=1][family][~92 zeros]
+            (a pre-allocated outgoing message frame with the body reserved
+            but not filled - the client sits waiting for something to populate
+            this buffer, and never does in tournament mode)
+      hit7: structured record with family + values [1, 5, 3, 0, 0] and a linked
+            list of ~32B records containing paired 16-bit IDs in the range
+            0x6D60-0x9800 (28000-38900). Purpose unclear - possibly hashes,
+            versions, or a msgid registry for a DIFFERENT (retail?) build.
+      "1.74.0.104319" build-string entry near a family ID - a service/plugin
+            manifest holding version + family together.
+
+  - The REGISTRY that holds all these family entries was found (v82): six
+    contiguous 8-byte pointers indexing all six family entries at one address.
+    This is the owning container; v83 tried to dump its header for identifying
+    metadata but the follow-up run only caught 1 entry (timing-dependent).
+
+WHAT THIS DID NOT REVEAL:
+  - No msgid-to-wire-msgid mapping visible in heap for family 0x11D82194.
+    Family 0x11D82194's descriptors only list messages 0x01..0x04 (from live
+    .rdata decrypt in Section 2H). The retail wire msgids (0x0100..0x010A)
+    for family 0x48CBF320 do not map onto ours by simple offset.
+  - No populated 0x0102 template with real record contents. The client's
+    outgoing buffer for msg 0x02 sits EMPTY in tournament mode - it has the
+    header set but the body is zeros. So the client either doesn't fill it
+    (because tournament mode strips that step) or fills it only after
+    receiving a triggering server message.
+
+NET: the heap tells us the family is registered and has allocated buffers,
+  but does NOT hand us the message content we need to send. The content is
+  derived at decode/dispatch time from decrypted logic (confirmed in Sections
+  2K, 2L, 2O). Read-only memory scanning is genuinely exhausted.
+
+################################################################################
+##  SECTION 2R: JSON DECODER + CONNECT-MIRROR - BOTH RULED OUT (2026-08-28)
+################################################################################
+
+Two more clean-negative experiments to record so nobody re-runs them:
+
+JSON DECODER PATH (json_test_server.py, 15 variants: 5 JSON bodies x 3 framings
+  including protocol-type byte prefix and 0x0102/0x3004 channels).
+  Result: ALL 15 variants flat 5000ms timeout in v57. The JSON decoder that
+  the .rdata metadata (Section 2I: "for json decoding" strings) advertised is
+  NOT reachable from the server side in tournament mode. Protocol type is
+  fixed to binary. Clean negative, do NOT retry.
+
+CONNECT-MIRROR SHAPE (mirror_test_server.py, 6 candidates including the well-
+  motivated 0x0102 with counter=0 + family echoed, mirroring the exact wire
+  form of the client's connect frame):
+  Result: ALL 6 flat 5000ms timeout. The "full-shaped" ack (msgid + counter +
+  family) is not what the client wants. Clean negative.
+
+msg 0x04 SPECULATION (msg04_test_server.py, 30 variants: 6 wire-msgid guesses
+  x 5 body encodings, built on the theory that msg 0x04's simpler descriptor
+  fields = scalar u32s = a token-less tournament proceed-message):
+  Result: 28 variants tested, all flat 5000ms timeout. Either msg 0x04 is not
+  the proceed-message, or none of the guessed wire msgids match, or the body
+  needs content we can't derive. Clean negative on those combos.
+
+################################################################################
+##  SECTION 2S: iEvE PROOF-OF-POSSIBLE + CURRENT UNDERSTANDING (2026-08-28)
+################################################################################
+
+iEvE (via Zagrion, forwarded quote): "you activate a special authorization
+mode in the lobby". iEvE has PRIVATELY reached both the main menu and in-game
+on 1.74 tournament mode. His work is fully private (will not share).
+
+What this changes: it PROVES the second message is constructible from the
+client itself - iEvE did it, using the same client and same tournament mode
+we have. So the answer is derivable, not gated on a capture. Our search has
+been in the right direction; we simply have not found the specific bytes.
+
+CURRENT BEST UNDERSTANDING OF THE BLOCKER:
+  1. Client sends 0x0100 [seq][family=0x11D82194] (10B connect).
+  2. Server sends bare 0x0102 (2B ack) - accepted, holds structurally.
+  3. Client polls 0x0103.
+  4. Client waits ~5000ms for a specific SECOND SERVER MESSAGE that
+     advances state (+0x70) from 6 to 7+.
+  5. If it doesn't arrive, session times out (status 6->2). Success() at
+     0xE38600 fakes the verdict but does NOT advance state (Section 2O).
+  6. That second message is one of msgs 0x02/0x03/0x04 in family 0x11D82194,
+     and it's an "authorization successful" signal per iEvE's description.
+     Zagrion's reasoning (WoW analogy): retail = bnet token + session token;
+     tournament = stripped, no token, just a "you're cleared" flag.
+
+WHAT WE'VE DEFINITIVELY RULED OUT AS THE SECOND MESSAGE:
+  - Bare 0x0102 (empty)                          (times out)
+  - Retail 0x3004 body (wrong family)            (times out)
+  - JSON on any channel                          (protocol type fixed to binary)
+  - Connect-mirror shapes (0102 ctr0 family etc) (times out)
+  - Schema-built 0x02 with any handle we could source (unstable session+0x54)
+  - 28 variants of msg 0x04                      (times out)
+  - Retail 0x0102 (896B, wrong family 0x48CBF320) (times out)
+
+REMAINING KNOWN UNKNOWNS:
+  - The exact WIRE MSGID for family 0x11D82194's messages (msg 0x02 = 0x0102?
+    something else? We tested 0x0102/0x0104/0x0200/0x0201/0x0202/0x0203/0x0204
+    and none advanced state).
+  - The BODY STRUCTURE of the awaited message (likely count-prefixed records
+    mirroring retail's 0x0102, but with our family's type tags).
+  - Whether the msgid range differs (family 0x48CBF320 uses 0x01xx wire msgids;
+    ours might use a completely different range).
+
+Solo iteration on message content has been thorough enough to conclude the
+answer is not reachable by black-box shape-guessing. The next productive
+inputs are (a) a tournament capture, (b) a static decoder reversal from someone 
+able to read past Arxan (which we cannot safely observe from runtime).
 
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
