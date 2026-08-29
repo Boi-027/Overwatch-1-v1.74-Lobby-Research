@@ -12,6 +12,9 @@ server message: the accept and the client's poll loop are two separate
 subsystems, and the poll still wants a response we can't yet form. This repo
 exists so that work isn't repeated.
 
+(Also, someone has managed to get into the main menu already and is planning to release a full game server, 
+this project is to see weather or not we can get intot he Main Menu before they release their private server.)
+
 ---
 
 ## What is solved
