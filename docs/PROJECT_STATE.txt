@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-28 (rev 14)
+  Last updated: 2026-08-28 (rev 15)
 ================================================================================
 
 MAIN GOAL
@@ -1181,8 +1181,92 @@ REMAINING KNOWN UNKNOWNS:
 
 Solo iteration on message content has been thorough enough to conclude the
 answer is not reachable by black-box shape-guessing. The next productive
-inputs are (a) a tournament capture, (b) a static decoder reversal from someone 
-able to read past Arxan (which we cannot safely observe from runtime).
+inputs are (a) a tournament capture, (b) iEvE opening his work, or (c) a
+static decoder reversal from someone able to read past Arxan (which we cannot
+safely observe from runtime).
+
+
+################################################################################
+##  SECTION 2T: FULL MESSAGE-PIPELINE MAP (owobs v79-v90) (2026-08-28)
+################################################################################
+
+Deep runtime reverse of the JamMessage decode/dispatch pipeline for the lobby
+family. This maps the entire machinery a message flows through - the most
+complete picture of the lobby message system to date.
+
+POST-SUCCESS CODE EXECUTION (v84/v85):
+  After Success() forces status=7, the client (believing itself accepted)
+  executes a decoder call-chain that touches these RVAs (caught on the stack):
+    +0x2172D56, +0x2377C28, +0x2377CBE, +0x4CC9E7  (mid-function returns)
+    +0x561D4C, +0x56520B, +0x567FD1, +0x56D01F      (decoder cluster)
+  State (+0x70) still does NOT advance to 7 - Success fakes the verdict, the
+  decode path runs, but without a real message to consume, state stays 6.
+  Only ~1 new family object + a few 1MB heap arenas allocated post-Success;
+  the client does not build forward-looking state until it gets the real msg.
+
+DECODER CLUSTER - CLASSIFIED (v86/v87):
+  Clean, well-formed function entries (proper prologues, same class as
+  Success which we can call):
+    +0x565130  vtable slot 0. Reads [rcx+0x60] (STATUS). Likely the
+               status-dispatch entry. push r11; sub rsp 0x20; mov rcx,[rcx+0x60]
+    +0x5651F0  vtable slot 1 (shared method, in every message descriptor)
+    +0x56B2F0  thunk -> +0x56B230
+    +0x56C430  calls allocator +0x41C490
+    +0x56CA50  thunk -> +0x56D530 (the REAL decode fn)
+    +0x561D4C  orchestrator: calls +0x1866230, +0x56C660, +0x41C2A0 in sequence
+    +0x56D01F  reads [rcx+0x70] (STATE) then rcx's vtable, calls +0x565080
+  IMPORTANT: these are VTABLE METHODS (v88 found no direct E8 callers) -
+  invoked indirectly by the dispatcher through function pointers. They operate
+  on message-decode-context objects built ON THE STACK by their caller
+  (+0x56D530 takes rcx <- [rbp+0], a local). So they CANNOT be called directly
+  with just the session as 'this' - they need a decode-context object that
+  only exists transiently mid-decode. Calling directly would crash.
+
+THE MESSAGE REGISTRATION FUNCTION (+0x45E2B0) (v89/v90):
+  Found via: +0x565080 is called 12x in a tight cluster at +0x45E2C0..+0x45E7C9.
+  That region is the family's message-registration function. Pattern per msg:
+    call +0x565080          construct a JamMessage object (vtable +0x2609A50)
+    lea rax, [+0x25FD3X0]   load that message's descriptor
+    call +0x5651A0          register it
+  +0x565080 sets obj vtable = +0x2609A50 (the JamMessage vtable, 0x50 into the
+  metadata block at +0x2609A00 confirmed in Section 2I).
+
+THE 6 MESSAGE DESCRIPTORS (+0x25FD310, 0x20 stride):
+  SIX messages registered (not 4!). Each descriptor = 4 function pointers
+  [factory][shared +0x5651F0][method +0x45Fxxx][method +0x45Exxx]:
+    msg0 factory +0x4ECDE0    msg1 factory +0x4C9A40    msg2 factory +0x4CDDD0
+    msg3 factory +0x4934B0    msg4 factory +0x45EB30    msg5 factory +0x4D7D10
+  The per-message +0x45Exxx/+0x45Fxxx functions are the encode/decode/handler
+  methods. (Family 0x11D82194's descriptors in Section 2H listed msgs 0x01-0x04;
+  this registration builds 6 message objects - the family may have 6 message
+  types total, or this is a superset registration.)
+
+JamMessage VTABLE (+0x2609A50):
+    slot 0: +0x565130 (status-reader/dispatch)
+    slot 1: +0x5651F0 (shared, in every descriptor)
+    slot 2/3: +0x1CCC660
+  Metadata block +0x2609A00 decoded strings (confirming this is the right
+  machinery): "Unhandled JamMessage, unable to dispatch", and envelope field
+  names "seq" / "src" / "%s-data".
+
+WHAT THIS MAP GIVES / DOES NOT GIVE:
+  GIVES: the complete pipeline - registration fn, 6 message factories, the
+    decode vtable, the dispatch path, the exact functions that read status
+    (+0x565130) and state (+0x56D01F). Anyone with a tournament CAPTURE can now
+    map wire bytes -> which factory/decoder processes them almost immediately.
+  DOES NOT GIVE: the message CONTENT. The factories build empty objects; the
+    decoders parse incoming bytes into them. Neither encodes what BYTES a valid
+    "authorized/proceed" message contains - that is data the server sends, which
+    lives only in real server logic or a capture. The machinery is fully mapped;
+    the content bytes remain the one missing piece.
+
+STATE OF THE BLOCKER (unchanged in conclusion, maximally understood):
+  The second server message must flow through this decode path (now fully
+  mapped) to advance state 6->7. Its content cannot be derived from the client
+  code (it is what the server sends). Success() fakes the verdict but not the
+  state. Reachable inputs to finish: a tournament capture (map wire->decoder
+  with this pipeline), iEvE sharing, or a from-scratch content reconstruction
+  by someone who can read the server side.
 
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
