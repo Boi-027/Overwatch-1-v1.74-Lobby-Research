@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (QA-dev build)
-  Last updated: 2026-08-28 (rev 15)
+  Last updated: 2026-08-31 (rev 17)
 ================================================================================
 
 MAIN GOAL
@@ -1181,9 +1181,8 @@ REMAINING KNOWN UNKNOWNS:
 
 Solo iteration on message content has been thorough enough to conclude the
 answer is not reachable by black-box shape-guessing. The next productive
-inputs are (a) a tournament capture, (b) iEvE opening his work, or (c) a
-static decoder reversal from someone able to read past Arxan (which we cannot
-safely observe from runtime).
+inputs are (a) a tournament capture, (b) a static decoder reversal from someone 
+able to read past Arxan (which we cannot safely observe from runtime).
 
 
 ################################################################################
@@ -1267,6 +1266,198 @@ STATE OF THE BLOCKER (unchanged in conclusion, maximally understood):
   state. Reachable inputs to finish: a tournament capture (map wire->decoder
   with this pipeline), iEvE sharing, or a from-scratch content reconstruction
   by someone who can read the server side.
+
+
+################################################################################
+##  SECTION 2U: THE LOBBY PROTOCOL DESCRIPTOR - REAL FIELD NAMES (2026-08-28)
+################################################################################
+
+MAJOR schema breakthrough. Refocused on the VERIFIED lobby family +0x2CF0xxx
+(family 0x11D82194) after confirming via the family table +0x2CF0060 that it -
+NOT the +0x2C9Fxxx 6-message table - is the lobby's. (The +0x2C9Fxxx table from
+v89-v93 was a DIFFERENT subsystem; sending its messages was a near-repeat of the
+VoiceChat trap. Verify family membership before building - see below.)
+
+VERIFICATION (v95): the lobby family table +0x2CF0060 points to:
+    +0x10 -> +0x2CF0120 (msg 0x01), key 0000000111D82194
+    +0x60 -> +0x2CF0180 (msg 0x02), key 0000000211D82194
+    +0x80 -> +0x2CF0030 (msg 0x03), key 0000000311D82194
+  It does NOT reference +0x2C9Fxxx. So the 6-message schema was a detour.
+
+THE VERIFIED LOBBY MESSAGES (v96):
+  msg 0x01 CONNECT (+0x2CF0120) - the client SENDS this:
+     field [id=6 type=0x78 u32] + family. Wire: 0100 01000000 9421d811.
+  msg 0x02 RESPONSE (+0x2CF0180) - what the client WAITS FOR:
+     field1 [id=0xE type=0x78] size 0x10 (16B) -> sub +0x2CEFB60
+     field2 [id=0xE type=0x88] size 0xA0 -> sub +0x2CF0380 (the descriptor below)
+  msg 0x03 (+0x2CF0030): wraps msg 0x01 (points to +0x2CF0120)
+  msg 0x04 (+0x2CF0080): wraps msg 0x02 (points to +0x2CF0180)
+  So msg 0x03/0x04 are container/routing descriptors, not distinct messages.
+
+★★★ msg 0x02's SECOND FIELD IS A PROTOCOL DESCRIPTOR (v97/v98) ★★★
+  The sub-descriptor +0x2CF0380 names the fields (live-decrypted .rdata):
+     m_protocolCRC      (u32)
+     m_messageBase      (u32)
+     m_messageMax       (u32)
+     m_protocolFlags    (u32)
+     m_untrustedServer  (u8/bool)   <-- fits iEvE's "special authorization mode"
+     m_protocolName     (string)
+  Protocol name string = "LobbySystem" (RVA +0x2615330).
+  Related class string: "ClientLobbyMessageSystem_C::__LobbyServerConnectionUp"
+  (the connection-up handler - the event that fires on accept).
+
+  So the msg 0x02 the client awaits is a PROTOCOL DESCRIPTOR: the server
+  declaring "I speak protocol LobbySystem, CRC X, msgids base..max, and I am
+  an untrusted server". m_untrustedServer=TRUE is the strongest candidate for
+  the tournament-mode "special authorization" iEvE described (a local server IS
+  untrusted). This is NOT an entity handle - the handle-in-body theory
+  (Section 2N) was chasing the wrong field.
+
+  m_protocolCRC candidate values:
+    0x11D82194 - what the client SENDS in its connect (strongest candidate;
+                 we had mislabelled this the "family id" - it is very likely
+                 the protocol CRC itself)
+    0x71B14B3B - crc32("LobbySystem") (does not match, so the CRC is over the
+                 protocol DEFINITION, not just the name)
+    0x0F3EBB2F - a u32 in the field-meta block +0x2609E70
+
+TESTED (protocol_desc_test_server.py, 11 variants): msg 0x02 built as the
+  LobbySystem protocol descriptor - 3 CRC values x untrusted flag x encodings
+  (len-prefixed name, null-term name, family suffix, minimal, untrusted-first).
+  RESULT: ALL flat 5000ms timeout in v57. The correctly-NAMED descriptor with
+  real values still does not advance state.
+
+WHY THIS STILL TIMED OUT - THE KEY REALIZATION:
+  We have now sent, in increasing correctness: bare acks, retail bodies, JSON,
+  schema-built messages, and the correctly-named protocol descriptor with the
+  client's own values. EVERY one produces the IDENTICAL flat ~5000ms timeout -
+  never closer, never a different rejection. That uniformity is the finding:
+  the gate is NOT the msg 0x02 CONTENT. Section 2L proved our frame is
+  received, decrypted, and decoded into the client's buffer. Section 2T/v88
+  proved the decode functions are VTABLE METHODS invoked by indirect dispatch
+  through the queue at conn+0x250. The message is decoded but never DISPATCHED
+  to the state-6 handler - and the dispatch trigger does not depend on the
+  content we control. So no content of msg 0x02, however correct, advances
+  state, because the block is in delivery/dispatch, not content.
+
+LASTING VALUE OF THIS SECTION:
+  - The msg 0x02 response is a PROTOCOL DESCRIPTOR (LobbySystem), field names
+    and types fully recovered: m_protocolCRC / m_messageBase / m_messageMax /
+    m_protocolFlags / m_untrustedServer / m_protocolName.
+  - m_untrustedServer is the likely tournament "authorization" flag.
+  - The remaining unknown is the DISPATCH/DELIVERY trigger, not the content.
+    A tournament capture would show HOW the real advancing message is delivered
+    (sequence/timing/framing), which is what black-box content iteration cannot
+    reach. iEvE's success proves a delivery method exists.
+
+METHOD NOTE (reusable): before building messages for a descriptor table, VERIFY
+  it belongs to the target family by checking the family table's pointers
+  (+0x2CF0060 for lobby). The +0x2C9Fxxx detour cost a few experiments; the
+  VoiceChat misidentification (Section 3) cost three weeks. Always confirm the
+  subsystem first.
+
+
+################################################################################
+##  SECTION 2V: THE LOBBYSYSTEM HANDLER FAMILY + FIREHOSE FINDINGS (2026-08-31)
+################################################################################
+
+This session added a firehose observer (v102-v103), an error-string hunt
+(v104), and a deep read of the LobbySystem handler class (v105-v107). Real
+findings; the wall still stands.
+
+★ THE LOBBYSYSTEM HANDLER FAMILY (v105/v107 string hunt in .rdata):
+  The full class-method string table for the lobby system, present in .rdata:
+    LobbySystem_C::__LobbyServerConnectionUp        (accept path)
+    LobbySystem_C::__LobbyServerConnectionDown      (drop)
+    LobbySystem_C::__LobbyServerReceivedPingResponse
+    LobbySystem_C::__LobbyServerHelloReceived       (fires after our hello)
+    LobbySystem_C::__LobbyServerLoginResponse       (★ processes msg 0x02 body)
+    LobbySystem_C::__LobbyDisconnectFromLobbyServer
+    LobbySystem_C::LobbyConnectHelloErrorHandler    (fn +0x774030)
+    LobbySystem_C::LobbyConnectHelloTimeoutHandler
+    LobbySystem_C::LobbyDisconnectClientHandler     (fn +0x7776F0, mentions ProtoBuf)
+    LobbySystem_C::LobbyDisconnectFromServerHandler
+    LobbySystem_C::LobbySendClientHelloComplete
+  The intended flow is now explicit: client sends hello (msg 0x01) →
+  __LobbyServerHelloReceived fires → server sends login response →
+  __LobbyServerLoginResponse consumes it → __LobbyServerConnectionUp fires
+  (state advances). We reach step 1 and stall waiting for the login response.
+  On timeout, LobbyConnectHelloErrorHandler runs; on drop, DisconnectClient.
+
+FUNCTION LOCATIONS RECOVERED:
+  LobbySystem registration                 fn +0x143730
+  LobbyConnectHelloErrorHandler            fn +0x774030 (short callback,
+                                             reads [rcx+0x60] status)
+  LobbyDisconnectClientHandler             fn +0x7776F0 (mentions ProtoBuf +
+                                             Runtime Error)
+  __LobbyServerLoginResponse handler fn    NOT FOUND VIA STATIC LEA REFS
+  __LobbyServerHelloReceived handler fn    same - registered via table lookup,
+                                             not direct code refs
+
+  These *_C::__* handlers are registered through a table/vtable mechanism the
+  scanner did not resolve; their function pointers live in a registration
+  structure rather than being loaded by lea from the string. Section 2T
+  already showed decoder-cluster methods (+0x565130 etc) are vtable methods
+  invoked indirectly - same pattern here.
+
+PROTOBUF SCOPE (v106/v107 — resolves a worry, not the wall):
+  The client compiles in google::protobuf (descriptor.proto etc) AND has a
+  full "ProTelemetry\generated_protos\Client\*" tree of .pb.cc files, but
+  every one of those paths is under TELEMETRY. Lobby event NAMES like
+  "Blizzard.ClientLobby.LobbyServerLoginFailure" appear as protobuf event
+  type strings — these are the events the client SENDS TO TELEMETRY when
+  lobby operations fail, not the wire format of lobby messages.
+  Lobby wire format is not protobuf. Our JAM/schema approach was structurally
+  right; the flat descriptor encoding is correct in principle.
+
+THE +0x439904 DRAIN+DISPATCH CORE (v99-v101):
+  The dispatcher +0x41DB60 QUEUES decoded messages onto conn+0x250 but does
+  not call handlers. The drain-and-dispatch core is +0x439904:
+    +0x439909: call +0x173BA30       (get next queued message)
+    +0x439911: test rax,rax; jz +2C  (skip if empty)
+    +0x439923: CALL [r8+0x10]        ★ indirect dispatch (handler via vtable)
+    +0x43992B: (walk conn+0x250 list to next node)
+    +0x439966: cmp [rcx+0x20], 0x32  suspected gate; my disasm annotator's
+                                     immediate read here is unreliable and the
+                                     v101 live scan could not verify a real
+                                     conn object's +0x20 value (all hits were
+                                     zero-init memory false positives). So the
+                                     "gate is 0x32" reading is NOT confirmed.
+  Confirmed: the drain-and-dispatch core exists at +0x439904 and does indirect
+  handler dispatch. Not confirmed: the exact gate value or whether a state we
+  never reach is what blocks our messages.
+
+FIREHOSE OBSERVATION (v102/v103):
+  A 250Hz-1kHz session field diff caught a transient +0x2A8-2B8 cluster that
+  fires briefly (~50ms) during each handshake attempt. Initially looked like
+  a message-in-flight object; snapshotting the pointed-to objects (v103)
+  revealed they are Blizzard TELEMETRY event objects (audio device
+  enumeration, network disconnect events, timestamp/GUID/site strings). Not
+  lobby-protocol data. A genuine correction to the initial interpretation.
+  The +0x2E0/2E4 pair is a monotonically-growing double (exponential-backoff
+  retry timestamp), also not protocol data.
+
+ERROR-STRING HUNT (v104):
+  "Name contains invalid characters" appears ONLY in the heap (in telemetry
+  event buffers), not in Overwatch.exe's .rdata. Confirmed: this string comes
+  from a system library (network/URL/hostname validation) and reaches the
+  telemetry via error capture. Most likely a cert/DNS side effect from the
+  cainj (cert-authority injector) DLL loaded alongside, not a lobby-
+  handshake gate. Recorded as a red herring for the lobby-content problem.
+  "Invalid Protocol Type" @ +0x2609B78 is a real lobby error string but was
+  not found on the current failure path either.
+
+HONEST CALIBRATION OF THIS SESSION:
+  The runtime approach — read-only memory scan + pattern-matched disasm — has
+  extracted the schema, the field names, the handler family, and the pipeline
+  structure. It has not extracted the specific validation the client runs to
+  accept msg 0x02 as valid. That validation lives in the *_C::__*Handler
+  functions, which are indirect-dispatch and require either static
+  disassembly of Arxan-protected code (IDA + unwrapping) or observing a
+  successful session on the wire (tournament capture, iEvE's method). Solo
+  runtime iteration has converged. What remains here is the two known
+  external inputs — a capture, or iEvE's approach — plus documenting what
+  we have so the next iteration starts from a much sharper place.
 
 ################################################################################
 ##  SECTION 3: VOID - DO NOT USE (VoiceChat, not lobby)
