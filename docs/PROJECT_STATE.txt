@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (retail product, _retail_ folder, Product=pro)
-  Last updated: 2026-09-01 (rev 18)
+  Last updated: 2026-09-01 (rev 19)
 ================================================================================
 
 MAIN GOAL
@@ -266,19 +266,40 @@ FIELD TYPE ENUM (authoritative, from Prometheus's jam_messagedetail_window.h)
     16        DYNAMIC
     17        END
 
-JamPoolVtable - 1.74 LAYOUT (0.8's layout MINUS pool_name)
-    slot 0  +0x00  destructor_1
-    slot 1  +0x08  destructor_outer
-    slot 2  +0x10  pool_crc()        -> u32
-    slot 3  +0x18  returns_zero()    -> int (0 on the lobby pool, 256 on some)
-    slot 4  +0x20  min_msgId()       -> short
-    slot 5  +0x28  max_msgId()       -> short  (EXCLUSIVE)
-    slot 6  +0x30  allocate_pool(instance, msgId) -> JamMessage*
-    slot 7  +0x38  deallocate_pool(instance, messageInstance)
-  0.8 has pool_name() at slot 2 and everything shifted one later. 1.74 dropped
-  it, which is why 1.74 has no pool names anywhere.
-  Validated: the lobby vtable at RVA 0x2609D60 yields crc=0x11D82194, zero=0,
-  min=1, max=5 - matching the protocol descriptor exactly.
+JamPoolVtable - 1.74 LAYOUT  ★ CORRECTED rev 19
+  ★ THE ADDRESS A POOL OBJECT STORES AT +0x00 IS 8 BYTES BELOW WHAT THE
+    rev-18 VTABLE SCAN RECORDED. All slot numbers below are relative to the
+    address objects actually hold. rev 18's table was built from the +8
+    address and every slot index in it was one too low.
+    lobby: objects store 0x2609D58; rev 18 recorded 0x2609D60.
+    slot 0  destructor_1
+    slot 1  destructor_outer
+    slot 2  (per-protocol, small)
+    slot 3  pool_crc()      -> u32     `mov eax,imm32; ret`
+    slot 4  returns_zero()
+    slot 5  min_msgId()     -> short
+    slot 6  max_msgId()     -> short   (EXCLUSIVE)
+    slot 7  allocate_pool(pool, msgId) -> JamMessage*
+    slot 8  (shared across all pools, RVA 0x4CC9B0)
+    slot 9  per-protocol op taking an existing JamMessage*
+  Verified on two protocols:
+    LOBBY    0x2609D58  crc=11D82194 min=1     max=5      alloc=0x56CF50
+    ClientIn 0x25FEC40  crc=F5FF548A min=20500 max=20510  alloc=0x475380
+  slot 7 locks pool+0xA8, allocates from pool+0x10, then switches on the
+  msgId to construct the right message class.
+  slot 9 calls 0x565260 (get_message_info()->message_id) on its rdx argument
+  and switches on that, so it operates on an already-built message.
+
+POOL OBJECT LAYOUT (rev 19, live)
+    +0x00  vtable (see above)
+    +0x08  u32 refcount/among two u32s
+    +0x10  allocator; also a shared .data ptr identical across every pool
+           (RVA 0x2E51610 - a hashed string table, NOT the subsystem)
+    +0x18  u32 max message object size for this pool, then 0x80
+           lobby 0xA0, ClientInLobbyConnect 0x158 - the latter matches
+           msg 20500's schema extent (ends 0x157) exactly
+    +0x28/+0x30, +0x38/+0x40  intrusive list heads (self-referential = empty)
+    +0xA8  the pool's lock
 
 PROTOCOL DESCRIPTOR (a struct, and also a message field type)
     +0x00  m_protocolCRC      u32
@@ -450,14 +471,19 @@ BASELINE (do not re-measure)
   one-poll difference is jitter inside the fixed ~5000ms timeout, confirmed
   by the hold test (0x0103 answered on every poll holds 44+ polls).
 
-★ NO POOL INSTANCES EXIST AT THE LOBBY WALL
-  A memory sweep for objects whose vtable is any of the 105 known pool
-  vtables, repeated every 10s for 2 minutes with the client parked at state
-  6, found ZERO instances. Pools are constructed AFTER the connect completes.
-  Therefore no channel other than the lobby's is addressable at the wall, and
-  the whole 105-pool map is downstream of a gate that has not opened. This is
-  why the ClientInLobbyConnect experiment (channel 10, ids 20503/20504/20505,
-  correct schema-derived bodies) died instantly - the pool does not exist.
+★ POOL INSTANCES DO EXIST AT THE LOBBY WALL  ★ CORRECTED rev 19
+  rev 18 claimed a sweep found ZERO pool instances and concluded pools are
+  built only after connect. THAT WAS AN ARTIFACT: the sweep matched the +8
+  vtable addresses, which no object ever stores, so it could not have found
+  anything either way.
+  Re-run with exact pointer equality against the corrected (-8) addresses,
+  confirmed by reading each vtable's crc getter:
+      112 pool instances, 98 distinct protocols, stable across 10 passes.
+  BOTH the lobby pool (11D82194) and ClientInLobbyConnect (F5FF548A) are
+  live at the wall, with allocate_pool available.
+  The ClientInLobbyConnect wire experiment still died instantly, but the
+  reason is NOT "the pool does not exist" - that explanation is withdrawn and
+  the real reason is unknown.
 
 SESSION OBJECT (vtable RVA 0x2616260)
     +0x18  connection object pointer
@@ -691,6 +717,96 @@ WHAT DOES NOT PORT
 
 
 ################################################################################
+##  SECTION 7B: THE JAM ROUTER AND ASSOCIATION MAP  ★ NEW, rev 19
+################################################################################
+
+All of this is disassembly-derived and does not depend on any memory scan.
+
+THE ROUTER
+    0x560D90   route(rcx = subsystem, rdx = JamMessage*) -> bool in al
+  Its second .pdata chunk 0x560DDF does:
+      call 0x565240              ; crc = msg->get_message_info()->crc
+      cmp  eax, 0x11D82194       ; lobby special case
+      jne  0x560E4D              ; -> error path (builds 0x800000000000000F)
+      lea  r8, [r14+0xC0]        ; the association map
+      ... BST lookup, see below ...
+      jne  0x560EDC              ; found -> dispatch
+  r14/r15 are set at 0x560DB2: `mov r14, rcx` / `mov r15, rdx`.
+
+THE ASSOCIATION MAP at subsystem+0xC0 - a plain BST, NOT std::map
+      root      = *(map + 0x00)
+      left      = node + 0x08
+      right     = node + 0x10
+      key       = node + 0x20   (u32 protocol CRC)
+      NULL-terminated; the map address itself is the end() sentinel
+  The value offset is NOT established - see the warning in Section 8.
+
+JamMessage ACCESSORS (all go through vtable slot 2 = get_message_info)
+    0x565240   -> info->[0x18]  crc
+    0x565260   -> info->[0x1C]  message_id (u16)
+    0x565280   -> info->[0x00]  message_name
+  This independently confirms the JamMessageInfo layout in Section 2.
+
+LOCAL DISPATCH TEMPLATE (observed at 0xE3C720, a real caller)
+      lea  rcx, [rsp+0x30]
+      call <ctor>              ; e.g. 0x4F3210: base ctor 0x565080,
+                               ;   plant vtable, zero +0x58; returns the obj
+      lea  rdx, [rsp+0x30]
+      mov  rcx, [*(this+0x40)] ; the subsystem
+      call 0x560D90            ; route
+  Eight direct callers of 0x560D90 exist; in most of them rcx is the
+  caller's own `this`, i.e. those functions are methods of the subsystem.
+  0x18F5D70 obtains the subsystem by NAME:
+      0x56B470(manager, &out, "<name>", 3)   ; r8 is a C string, strlen'd
+  "LobbySystem" is at RVA 0x2615330.
+
+ALL 922 MESSAGE CLASS VTABLES ARE RESOLVED
+  Every message class exposes get_message_info() at vtable slot 2 as a
+  two-instruction `lea rax,[rip+X]; ret`, so all 922 were mapped statically
+  to their (crc, message_id):
+      lobby msg 1  vtable 0x2609CD8      msg 2  0x2609CF8
+            msg 3  0x2609D18             msg 4  0x2609D38
+      ClientInLobbyConnect 20500 0x25FEB00 .. 20509 0x25FEC20
+  (Full table: /home/claude/msgvtables.pkl regenerable from the dump.)
+
+WHAT IS STILL MISSING FOR LOCAL DISPATCH
+  Only the runtime subsystem pointer. Everything else - pool instances,
+  allocate_pool, message vtables, schemas, the router - is in hand.
+  NEXT IDEA (untried): pool instances are reachable FROM the association
+  map, so scan for a qword equal to a KNOWN pool instance address and walk
+  back to the containing structure. That is pointer equality, the only
+  technique that has not produced false positives on this binary.
+
+################################################################################
+##  SECTION 7C: MEMORY-SCAN FALSE POSITIVES - READ BEFORE SCANNING  ★ rev 19
+################################################################################
+
+Four consecutive scanning approaches produced confident-looking false
+positives in one session. This binary is unusually hostile to value-based
+heuristics because several large regions are DENSE in exactly the constants
+we search for.
+
+  v129  "3 heap pointers + a known CRC at +0x20"      -> telemetry text
+  v130  "{ptr,count} + BFS + >=3 known CRCs"          -> same region
+  v131  same, aligned dump                            -> per-protocol latency
+                                                         log ("+ 647 ms",
+                                                         "127.0.0.1"), 0x30
+                                                         stride
+  v133-135 "BST walk + strictly increasing known CRCs" -> a SORTED ARRAY of
+                                                         protocol CRCs next to
+                                                         audio device strings
+  The sortedness check does not discriminate: a sorted CRC array satisfies it
+  trivially. 86 of 87 "map entries" failed self-validation once we required
+  the pointed-to object to REPORT ITS OWN KEY.
+
+RULE: a signature keyed on VALUES finds whatever region is dense in those
+values. Only two things have worked reliably on this target:
+  1. exact pointer equality against a known address (v136, pool instances)
+  2. self-validation - make the data confirm itself (follow the pointer, read
+     the object's own crc getter, require it to equal the key you matched on)
+Always include (2) even when (1) looks conclusive.
+
+################################################################################
 ##  SECTION 8: VOID - DO NOT USE
 ################################################################################
 
@@ -777,7 +893,12 @@ Ordered by estimated value.
    with what is already in this repo. Anyone who ran playertools at an OWL or
    Showmatch event in 2022 may have one.
 
-3. FIND THE JAM DISPATCH FUNCTION.
+3. FIND THE SUBSYSTEM POINTER (supersedes rev 18's "find the dispatch").
+   The dispatch IS found (Section 7B). Only route()'s first argument is
+   missing. Scan for a known pool instance address as a VALUE and walk back
+   to its container.
+
+3b. (rev 18 framing) FIND THE JAM DISPATCH FUNCTION.
    "One big switch statement, second argument the already-deserialized
    JamMessage" (per the 39C3 talk). Locating it would allow calling handlers
    directly and bypass the wire entirely - which is the only approach that has
@@ -829,10 +950,13 @@ KEY OWOBS VERSIONS (rev 18 generation)
     v118  raw dump of .rdata pointer windows + getter bytes, for offline
           disassembly. 37 MB output; this is how the 105 pools were recovered.
     v119  JAM schema dump - 922 message registrations with field layouts
-    v120  pool instance finder (proved none exist at the wall)
+    v120  pool instance finder - VOID, used the +8 vtable addresses
     v123  keyring finder (read-only)
     v127  keyring injector, correct format and byte order
     v128  injector + session watch
+    v129-v135  association-map hunts - ALL FALSE POSITIVES, see Section 7C
+    v136  pool instance finder by exact vtable match (-8). 112 instances,
+          98 protocols, incl. lobby and ClientInLobbyConnect
 
 LOBBYSERV MODES (rev 18 generation, v146-v158)
     baseline     ack then silence; measures the 5-poll budget
