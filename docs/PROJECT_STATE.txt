@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (retail product, _retail_ folder, Product=pro)
-  Last updated: 2026-09-01 (rev 19)
+  Last updated: 2026-09-01 (rev 20)
 ================================================================================
 
 MAIN GOAL
@@ -465,6 +465,36 @@ THE LOBBY PROTOCOL - family 0x11D82194, EXACTLY FOUR MESSAGES
   (u32 zero/one/0xFFFFFFFF/family, and bare/empty for msg 4). All zero
   polls. Conclusion: messages 1 and 4 are CLIENT->SERVER ONLY.
 
+  ★ MESSAGE 2 IS ALSO CLIENT->SERVER ONLY (settled rev 20).
+  msg 2's real schema (read from the nested item tables, not guessed):
+      [0] STRUCT 0x10 @0x78 -> { double, double }   (NOT an entity handle;
+          the handle theory of Section 2N was wrong)
+      [1] STRUCT 0x40 @0x88 -> ProtocolDescriptor, and this field is an
+          ARRAY (its item record carries the vector-resize thunk)
+          { u32 crc, u32 base, u32 max, u32 flags, u32 untrusted,
+            STRING_ARR name(0x28) }
+  Sent on the CORRECT wire msgid this time - 0x0101, i.e. (channel 1, index
+  1 = message_base+1). Earlier "descriptor" attempts were sent on 0x0102
+  (message 3, which has NO fields) so were never parsed; that confound is
+  now removed. 12 encodings tried on 0x0101, including the GDC-2013 array
+  form [u32 count][elements] with count=1, and the decisive control U_cnt0:
+      [double,double][u32 count=0]   (20 bytes)
+  U_cnt0 is a STRUCTURALLY VALID msg 2 with an empty descriptor array -
+  correct under every encoding hypothesis. It scored polls=0 (instant
+  teardown) exactly like every malformed body. So content on 0x0101 is
+  irrelevant: the frame is rejected before the body is examined, i.e. msg 2
+  is not accepted inbound at all.
+
+  NET: the lobby family 0x11D82194 has exactly ONE server->client message,
+  message 3 (the empty ack). This mirrors retail, where the server acks the
+  client's 0x0000 connect with a bare 0x0002 (same channel, index 2) and the
+  message that actually ADVANCES the client is 0x3004 - a DIFFERENT CHANNEL.
+  So the advancing message was never going to be in this family. It arrives
+  on whatever channel the next protocol is assigned, and the channel sweep
+  (Section 9) only ever sent BARE frames, which only empty-body messages
+  tolerate - so that sweep never actually tested any channel whose first
+  message has fields. The lobby-family line of attack is EXHAUSTED.
+
 BASELINE (do not re-measure)
   Bare 0x0102 ack + total silence = exactly 5 polls before close. Reproduced
   14/14. Any tolerated frame injected afterwards gives 4 polls - that
@@ -807,6 +837,91 @@ values. Only two things have worked reliably on this target:
 Always include (2) even when (1) looks conclusive.
 
 ################################################################################
+##  SECTION 7D: THE BNET ROUTE - BLOCKER IS BORINGSSL PUBLIC-KEY PINNING
+##                                                          ★ NEW, rev 20
+################################################################################
+
+The non-tournament (Battle.net) route was pursued because tournament mode is
+exhausted (Section 4) and because the retail path has GROUND TRUTH: the
+decrypted capture (Section 5) is a complete real server transcript, and two
+people (Sidiusz, iEvE) reached further on the bnet path than anyone has in
+tournament mode.
+
+SETUP THAT NOW EXISTS (in the repo, bnetgo/):
+  plasmawatch/login-server (Go), patched: k0-k3 = all zeros, hostv4 =
+  127.0.0.1:3724. This is a Battle.net RPC emulator. The key insight it
+  proves: the client's lobby session keys (k0-k3, the schedule in Section 1)
+  are DELIVERED by the bnet response GameUtilities.ProcessClientRequest, as
+  attributes literally named k0/k1/k2/k3 plus cid and hostv4. We choose them,
+  so zero keys means the EXISTING ZERO_KEY lobbyserv works while the client
+  takes the RETAIL code path instead of --tank_TournamentMode.
+  Also present: webauth.py (HTTPS :443, mirrors login-server's webserver.go
+  login form), makecert.sh, run_all.bat.
+  The bnet cert to use is cainj/bnet_server.pem + .key (CN=*.battle.net, SANs
+  cover us.actual.battle.net, bnet-emu.fish, 127.0.0.1) - it is signed by the
+  CA cainj injects, so the chain is intact.
+
+★ THE WALL: the client connects to 1119, sends a full modern ClientHello
+  (TLS 1.0-1.3, 31 cipher suites, X25519), then CLOSES THE CONNECTION DURING
+  THE HANDSHAKE, at the point it validates the server certificate. The Go
+  server (instrumented in bnetgo3) logs:
+      === CLIENT HELLO ===  SNI:""  versions:[772 771 770 769] ...
+      *** TLS HANDSHAKE FAILED: EOF ***
+  This is IDENTICAL with the original bink2w64 (no cainj/owobs), so it is the
+  client's own behaviour, not our DLLs.
+
+  SNI IS EMPTY. The client connected by IP (127.0.0.1 via the hosts file) and
+  sent no server name. So hostname validation is not what fails - there is no
+  name to check.
+
+★ IT IS BORINGSSL PUBLIC-KEY PINNING. The binary contains, as stripped
+  BoringSSL error strings:
+      "SSL public key does not match pinned public key"   @ RVA 0x298360d
+      "ssl_public_key_pinning_check_failed"               @ RVA 0x298e537
+      "ssl_cert_chain_bundle_verification_failed"         @ RVA 0x298e559
+      "ssl_cert_chain_system_verification_failed"         @ RVA 0x298e583
+      "Issuer check against peer certificate failed"      @ RVA 0x2983385
+  The pinning hook is BoringSSL SSL_CTX_set_custom_verify(ctx, mode, cb),
+  where cb returns enum ssl_verify_result_t { ok=0, invalid=1, retry=2 }.
+  The client pins the server's PUBLIC KEY (compares it to a hardcoded pin),
+  which is why NO cert/CA/verify_mode change can pass it - cainj does CA-add
+  + verify_mode=0, both irrelevant to a public-key pin. This is exactly what
+  Sidiusz described: he did NOT add a CA, he "patched the heap-parsed pin/
+  verify result", hooking the high-level pinning + chain-verify and forcing
+  them to pass, "one shot at load is enough".
+
+★ THE FIX (a DATA write, so Arxan-compatible), TWO OPTIONS:
+  (a) repoint the custom_verify callback in each live SSL_CTX to a stub that
+      returns 0 (ssl_verify_ok). cainj already locates SSL_CTX objects (it
+      writes verify_mode at ctx+0x80 / +0x94), so the callback pointer is a
+      nearby field to read and overwrite.
+  (b) find the pinned public-key blob on the heap and overwrite it with the
+      SHA-256 of OUR cert's public key, so the compare passes legitimately.
+      cainj found the cert store adjacent, so the pin set is likely near it.
+
+★ WHY IT ISN'T DONE YET: the callback/pin ADDRESS is not recoverable from
+  the static dump. Every BoringSSL error string has ZERO lea/pointer xrefs -
+  the whole error subsystem is behind the same obfuscation as the JAM
+  strings (Section 7B). Shape-based static search for the callback returns
+  ~375 small return-0/1 functions, too generic to isolate. So the address
+  needs RUNTIME discovery: an owobs pass over the SSL_CTX objects cainj
+  finds, reading the custom_verify callback field and either repointing it or
+  following it to the pin blob.
+
+★ HIGHEST-LEVERAGE INPUT: Sidiusz has the exact function/offset he patched
+  and reached the login form + "CONNECTING TO GAME SERVER". One question -
+  which function, what offset - likely saves the entire runtime hunt. He is
+  responsive and has moved off OW1 (no reason to withhold). He also confirmed
+  the handshake field-for-field and that lobby crypto is a nonce swap, not
+  x25519 (the x25519 in the binary is the bnet cert layer).
+
+  If the bnet path completes, the client should follow the RETAIL sequence
+  (server: 0x0002 ack -> 0x3004 -> 0x3005 manifest -> 0x4e0d identity...),
+  for which cli_dec.bin + srv_dec.bin are a byte-exact template. That is the
+  reason this route is worth more than tournament: ground truth instead of
+  black-box guessing.
+
+################################################################################
 ##  SECTION 8: VOID - DO NOT USE
 ################################################################################
 
@@ -880,6 +995,12 @@ came from skipping that check.
 ################################################################################
 
 Ordered by estimated value.
+
+0. UNBLOCK THE BNET ROUTE (Section 7D) - now the most promising line.
+   The blocker is BoringSSL public-key pinning; the fix is a heap data patch
+   of the custom_verify callback or the pinned key. Get Sidiusz's offset, or
+   scan live SSL_CTX objects (cainj already finds them) for the callback
+   pointer. This route has retail ground truth waiting on the other side.
 
 1. GET KEYS FOR ONE MORE CAPTURE.
    The decryption pipeline is proven end to end. k0-k3 for login-enc.pcapng
@@ -957,6 +1078,12 @@ KEY OWOBS VERSIONS (rev 18 generation)
     v129-v135  association-map hunts - ALL FALSE POSITIVES, see Section 7C
     v136  pool instance finder by exact vtable match (-8). 112 instances,
           98 protocols, incl. lobby and ClientInLobbyConnect
+    v137  subsystem-via-pool-backref - phase 2 self-validated, phase 3 noisy
+    lobbyserv v160  msg2-on-0x0101 tester (12 encodings); all rejected, incl.
+          the empty-array control - proved msg 2 is inbound-rejected
+    bnetgo/  Battle.net RPC emulator (Go), TLS-instrumented in bnetgo3;
+          proves the bnet blocker is public-key pinning
+    webauth.py  HTTPS :443 login-form server for the bnet route
 
 LOBBYSERV MODES (rev 18 generation, v146-v158)
     baseline     ack then silence; measures the 5-poll budget
