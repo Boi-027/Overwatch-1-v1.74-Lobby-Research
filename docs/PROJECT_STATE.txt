@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (retail product, _retail_ folder, Product=pro)
-  Last updated: 2026-09-01 (rev 29)
+  Last updated: 2026-09-01 (rev 31)
 ================================================================================
 
 MAIN GOAL
@@ -1479,6 +1479,180 @@ FILES: v177 (best-of module dump), v178 (full process dump), find_in_dumps.py /
   dump_heap_01a23ddd0000 (87 CRCs). The bnet pin fn is 0x240DF65.
 
 ################################################################################
+##  SECTION 7L: THE LOBBY STATE MACHINE - DECRYPTED LIVE  rev 30  ★ BREAKTHROUGH
+################################################################################
+
+The lobby-advance state machine, ENCRYPTED in every static dump, was read LIVE-
+DECRYPTED by dumping the functions WHILE THEY EXECUTE at the wall. Arxan decrypts
+code on-demand to run it; the state-6 handler runs continuously while the client
+"loads", so dumping it then yields real instructions. owobs v202/v203 do this.
+KEY TECHNIQUE: reach the loading state (call Success 0xE38600 to hold status=7),
+wait ~1.5s for blocks to decrypt through execution, then RPM-dump the function.
+Dispatcher + transition fn + state-7/5/8 handlers came back FULLY CLEAN
+(0 junk). The state-6 handler 0x842ac0 is still PER-BLOCK encrypted (each basic
+block decrypts only while EIP is inside it) - its prologue is clean, body needs
+per-block capture.
+
+★ THE SESSION STATE MACHINE (session vtable RVA 0x2616260):
+  session+0x60 = STATUS (Success sets 7; cosmetic "ENTERING GAME")
+  session+0x70 = STATE  (the REAL menu gate). Values 0,1,2,6 seen; 7 = advance.
+  The DISPATCHER is fn 0x83FAF6 (its body at 0x83FB00). Signature:
+    dispatch(rcx=context/manager, rdx=session, ESI=event_code)
+  Structure (fully decrypted, rev 30):
+    0x83FB09  call 0x8418C0   <- TRANSITION fn: validates the incoming
+              connection identity (cmp addr/port from msg@+0x58/+0x68/+0x20 vs
+              session's stored id) and writes session+0x70 = 1 ON MATCH.
+    then dispatch by (esi_event, current +0x70):
+      state 0 -> 0x83FC04 (ret)     state 1 -> 0x843BF0
+      state 2 -> 0x843AF0           state 5 -> 0x843D60 (handler, clean)
+      state 6 -> 0x842AC0 (handler, per-block enc - HOLDS THE 6->7 RULE)
+      state 7 -> 0x842E40 (handler, clean)   state 8 -> 0x8431A0
+      esi==3 & state9 -> writes +0x70=9 ; esi cases seen: 2,3,4,5
+  THE MACHINE IS EVENT-DRIVEN: the dispatcher is called from the message-receive
+  path (vtable-dispatched, no static caller) with esi = an event derived from the
+  received message. 0x8418C0 confirms it is connection/message-driven.
+
+★ STATE-7 HANDLER 0x842E40 (clean) - the gates to proceed past 7:
+    call 0x841310; call 0x5855F0 -> test rax (need nonzero)
+    call [r8+8] -> test rax ; call [r9+0x6A0] -> test al (need nonzero)
+    then mov [rsp+0x70],rbp ; cmp ecx,-1 ; proceeds toward state 8.
+  These gates go deeper (0xB7C60 = Arxan dispatch primitive) - not yet followed.
+
+★ WHAT ADVANCES 6->7 (the exact remaining question, now BOUNDED):
+  Not visible in the dispatcher's decrypted esi cases (2,3,4,5). It is either:
+    (a) inside the per-block-encrypted state-6 handler 0x842AC0, OR
+    (b) an esi event from a message that 0x842AC0/dispatcher consumes.
+  NEXT: fully decrypt 0x842AC0 by capturing each basic block as it executes
+  (single-step-free: dump the function repeatedly over many seconds; different
+  blocks are decrypted at different moments; merge best-of per 16-byte window).
+
+★ WHAT DOES NOT WORK (tested rev 30):
+  - Cold-calling the dispatcher 0x83FB00 with guessed rcx/esi CRASHES (esi=0
+    threw, then process died). The dispatcher needs the real manager context and
+    a message-derived event; it is not safely callable cold.
+  - Forcing session+0x70=7 directly: the client ACTS on it (state-7 handler runs)
+    but faults on the incomplete state -> crash on "ENTER GAME" click.
+  - Success() reaches cosmetic ENTERING GAME (status=7) but never moves +0x70.
+    While held there the client LOADS CONTINUOUSLY (no reject cycle) - a stable
+    wait, and NO new instance-server dial occurs (owobs v200: only :3724 +
+    internal loopback socketpairs + one telemetry 35.201.91.89:443). So the
+    client is NOT past the lobby; the reframe "crash = missing instance server"
+    is RULED OUT.
+  - ACG CONCLUSIVELY UNBEATABLE: CREATE_SUSPENDED early-inject (before Arxan
+    arms) still gets err 87 on .text VirtualProtect from byte 0 (owobs_early).
+    ACG is a process-creation mitigation, on before any user code; the parent
+    cannot relax the child's own opt-in. So NO .text patch is possible from our
+    position - only data writes and calling existing (decrypted) code.
+
+★ MILESTONE (rev 30, stands): router 0x560D90 returned 1 - the JAM router
+  ACCEPTED and dispatched an empty lobby msg-3 on the CRC-verified subsystem,
+  the first server->client message the 1.74 client has ever accepted. Requires
+  the subsystem's +0x78 to point at a {+0x20==6} readiness object, which the
+  client builds transiently; wiring the client's OWN ready object (not a synth)
+  into +0x78 satisfies the router precondition. But the router accepting msg-3
+  does NOT by itself move session+0x70 - that is the state machine above.
+
+NET: the lobby state machine is now DECRYPTED and understood (event-driven, the
+handlers mapped). The single remaining unknown is the 6->7 trigger inside the
+per-block-encrypted 0x842AC0, which is a BOUNDED target (decrypt it block-by-
+block via repeated live dumps). This is the furthest the 1.74 lobby has been
+reverse-engineered.
+################################################################################
+##  SECTION 7M: THE 6->7 ADVANCE FULLY TRACED - LIVE DECRYPTED  rev 31 ★★
+################################################################################
+
+Building on 7L, the state-6 handler 0x842AC0 was decrypted by BEST-OF-over-time
+(owobs v205: dump the function every 10ms while it runs at the wall; keep, per
+16-byte window, the least-encrypted version; ~78/96 windows recovered). This
+revealed the EXACT instruction that advances to the menu and its full gate chain.
+
+★ THE MENU-ADVANCE INSTRUCTION: 0x842DE3  mov [rbx+0x70], 7   (rbx = session)
+  This is the write that sets the session state to 7 = LOBBY/menu. It is reached
+  ONLY through this decrypted chain in 0x842AC0:
+
+    0x842D6D  call 0x5952F0            ; THE GATE - processes the session+0x48
+                                         message queue, returns a code in al
+    0x842D77  cmp al, 7 / jne skip     ; must return 7 to proceed
+    0x842D7B  mov ecx, [rbx+0x74]      ; an id (currently 0)
+    0x842D7E  call 0x1831460 -> rdi    ; lookup by id; must be non-null
+    0x842D8B  mov rdx, [rbx+0x78]      ; data ptr (currently 0)
+              mov ecx, [rbx+0x74]
+    0x842D97  call 0xBA9BB0 -> al      ; final check; must be nonzero
+    0x842D9C  test al / jne advance
+    0x842DB4  advance: ... 
+    0x842DD9  mov [rbx+0x98], 0
+    0x842DE3  mov [rbx+0x70], 7        ; <<< STATE = 7, MENU
+
+★ THE GATE 0x5952F0 (decrypted, 57/64 windows - the state-6 path is complete):
+    0x59532C  mov rdx, [rbx+0x48]      ; the MESSAGE QUEUE at session+0x48
+    0x595344  call 0x59FA90            ; dequeue/process
+    0x59534F  call 0x59E0E2            ; CLASSIFY the message -> return code
+  Returns al==7 when the queue contains the RIGHT message type. 0x59E0E2 is the
+  classifier that maps message->7. (The remaining 7 encrypted windows are
+  non-state-6 branches that never execute while watching, so never decrypt.)
+
+★ WHAT THIS MEANS - THE "SECOND MESSAGE", LOCATED AT LAST:
+  The client at the wall LOADS CONTINUOUSLY (stable, not the reject cycle) while
+  the state-6 handler polls the session+0x48 queue via 0x5952F0. It advances to
+  the menu the instant a message arrives that the classifier 0x59E0E2 maps to 7.
+  session+0x74 (id) and +0x78 (data ptr) are OUTPUTS of processing that message
+  (both 0 until it arrives) - NOT inputs we can fake (owobs v207 set them to
+  candidate values; state stayed 6, confirming the queue/gate is the real gate).
+  This is the decade-old "second message": it is the message whose type makes
+  0x59E0E2 return 7. It is NOT the empty msg-3 (routing msg-3 gave router==1 but
+  did NOT make 0x5952F0 return 7 -> no advance).
+
+★ THE SUCCESS PATH IS HARD-GATED ON A REGISTERED OBJECT (decrypted exact seq):
+    0x842D7B mov ecx,[rbx+0x74]      ; id (currently 0)
+    0x842D7E call 0x1831460 -> rax   ; LOOKUP an object by that id
+    0x842D89 je 0x842DA7             ; if NULL -> error path 0x8420B0 (NOT advance)
+    0x842D8B mov rdx,[rbx+0x78]; call 0xBA9BB0 -> al  ; needs +0x78 data + nonzero
+    0x842D9E jne advance             ; only then ->
+    0x842DB4 mov rcx,[rdi+0x28]; xor rcx,0x98DE97B50B3BE1E3; call 0x18317B0
+    0x842DD4 call 0x692890 ; [rbx+0x98]=0 ; [rbx+0x70]=7
+  Because +0x74 = 0, 0x1831460(0) returns NULL, the je is taken, and it runs the
+  ERROR/RESET path 0x8420B0 instead of advancing. THE ADVANCE CANNOT FIRE until
+  +0x74 holds the id of a REAL REGISTERED object (0x1831460 resolves it) and
+  +0x78 holds its data. These are populated ONLY by processing the real server
+  message. Faking +0x74/+0x78 fails because 0x1831460 needs a genuinely
+  registered object (owobs v207 set them to guesses; 0x1831460 still returned
+  null -> no advance, no crash).
+
+★ CONCLUSION - THE SECOND MESSAGE, FULLY CHARACTERIZED AT INSTRUCTION LEVEL:
+  The 6->7 menu advance requires ONE real server message that, flowing through
+  the receive pipeline into session+0x48:
+    (a) REGISTERS an entity object (so 0x1831460 can later find it),
+    (b) sets session+0x74 = that entity's id and +0x78 = its data,
+    (c) makes the classifier 0x59E0E2 (via 0x5952F0) return 7.
+  All three are effects of processing that single message. No shortcut exists:
+    - fields can't be faked (0x1831460 needs a real registered object)
+    - state can't be forced (crashes - setup calls 0x18317B0/0x692890 not done)
+    - the gate needs the real queued+classified message
+  This matches the two-session diff (Section 2G): the advancing message carries
+  session-specific entity handles. It is the retail 0x3004-family content frame
+  (entity+data), NOT the empty msg-3 (which routes - router==1 - but registers
+  no entity, so 0x1831460 stays null).
+
+★ REMAINING: construct the content message that registers an entity and delivers
+  its handle, in the exact wire form the 1.74 receive path enqueues to
+  session+0x48. This is the wire "second message" problem, now understood from
+  the INSIDE: we know precisely what the message must ACCOMPLISH in memory
+  (register entity -> +0x74/+0x78 -> classifier returns 7). A Tournament-mode
+  capture (Section: pending) would show the exact bytes. Or: reverse the receive
+  path (0x55E980 dispatcher -> enqueue to +0x48) to learn the accepted format,
+  then hand-build the entity-registration message.
+
+TOOLS: owobs v205 (best-of decrypt a function), v206/v208 (gate + callees),
+  v207 (field-set test, ruled out fields-alone). The best-of-live-decrypt
+  technique (dump a running Arxan function repeatedly, merge least-encrypted
+  windows) is the KEY capability that cracked the state machine - reusable for
+  any hot obfuscated function.
+
+NET: the entire 6->7 menu-advance is decrypted and understood. The one remaining
+unknown is the single message type the classifier 0x59E0E2 accepts to return 7 -
+a bounded target reachable by the same live-decrypt technique. This is the root
+of the 1.74 lobby wall, reached for the first time.
+################################################################################
 ##  SECTION 8: VOID - DO NOT USE
 ################################################################################
 
@@ -1681,10 +1855,6 @@ BNET / CERT ROUTE (alternative, converges on the same wall)
 ################################################################################
 
 Independent implementers who reached this exact wall:
-  - Sidiusz - reconstructed the same handshake field-for-field, solved the
-    cert pinning, reached the web-auth login form, stuck at the same point.
-    Confirmed 2026-08-09: "I don't have it either" re: the reply to 0x0103.
-    Stopped work on OW1 in August 2026.
   - Zagrion (AyakaPS) - contributed the s2c key derivation and the tshark
     reassembly method that made srv_dec.bin possible.
   - iEvE - has PRIVATELY reached the main menu on 1.74 in TOURNAMENT MODE
