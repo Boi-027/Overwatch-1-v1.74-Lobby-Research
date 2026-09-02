@@ -1633,6 +1633,26 @@ revealed the EXACT instruction that advances to the menu and its full gate chain
   (entity+data), NOT the empty msg-3 (which routes - router==1 - but registers
   no entity, so 0x1831460 stays null).
 
+★★ CRITICAL OBJECT-IDENTITY CORRECTION (rev 31): the state-6 handler 0x842AC0
+  reads [rbx+0x48] as a message QUEUE and [rbx+0x70] as state. But the
+  0x2616260-vtable "session" (the one Success 0xE38600 operates on, found by
+  vtable, holding "127.0.0.1:3724" at +0x40) has its +0x48 MID-STRING (the addr
+  string spans +0x38..+0x50) - so ITS +0x48 is NOT a queue. Live hex dump
+  confirmed: session+0x40='...:3724...', +0x48='1:3724', +0x70=6.
+  => The state machine's rbx is a DIFFERENT object than the 0x2616260 session.
+  ALL prior manipulation of the 0x2616260 session (Success, force +0x70=7,
+  route on it) was on the WRONG object - which is WHY forcing state=7 crashed
+  and routing never advanced. The 0x2616260 session at +0x70=6 is a red herring
+  that happens to share the +0x70 offset.
+  The REAL state object has +0x48 = a genuine heap queue and +0x78 = heap data.
+  owobs v214/v215 found 0-4 such objects but UNSTABLY (count varies per run,
+  none reliably at state 6) - scanning does not reliably anchor it. The real
+  state object is likely reached ONLY as the dispatcher 0x83FAF6's rdx argument
+  from the receive path - so it must be captured by HOOKING the dispatcher (or a
+  clean-prologue function near it) to grab rdx, not by memory scan.
+  NEXT-OBJECT step: hook/trap the dispatcher entry to capture the true state
+  object pointer, then apply the decrypted 6->7 analysis to THAT object.
+
 ★ REMAINING: construct the content message that registers an entity and delivers
   its handle, in the exact wire form the 1.74 receive path enqueues to
   session+0x48. This is the wire "second message" problem, now understood from
