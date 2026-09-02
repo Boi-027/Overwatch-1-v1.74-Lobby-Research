@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (retail product, _retail_ folder, Product=pro)
-  Last updated: 2026-09-01 (rev 20)
+  Last updated: 2026-09-01 (rev 26)
 ================================================================================
 
 MAIN GOAL
@@ -890,6 +890,22 @@ SETUP THAT NOW EXISTS (in the repo, bnetgo/):
   verify result", hooking the high-level pinning + chain-verify and forcing
   them to pass, "one shot at load is enough".
 
+★ REFINEMENT (rev 20, from cainj's own diagnostic): the pin is NOT a naked
+  BoringSSL app_verify_callback in the SSL_CTX. cainj's BFS from the cert
+  store logged: "NO object within depth<=2 holds cert_store==store => pin is
+  likely a C++ WRAPPER VIRTUAL METHOD, not an OpenSSL app_verify_callback."
+  So the Blizzard networking layer (bnl) wraps BoringSSL and the pin check is
+  a VIRTUAL METHOD on that wrapper object, reached through its vtable - which
+  is also why the BoringSSL pin strings have no static xrefs. cainj already
+  finds this wrapper (it logs "WRAPPER <addr> verify_mode +0x94" and knows
+  its vtable g_wrapVtbl). The BoringSSL custom_verify callback most likely
+  just forwards into this wrapper.
+  => The target is a VTABLE SLOT on the bnl TLS wrapper, and the patch is to
+     force THAT method's returned verdict (Sidiusz's "heap-parsed pin/verify
+     result"). Next concrete step: dump g_wrapVtbl's slots (extend cainj to
+     log them, or read the wrapper vtable live with owobs), disassemble each
+     to find the one returning the verify enum, and patch its result.
+
 ★ THE FIX (a DATA write, so Arxan-compatible), TWO OPTIONS:
   (a) repoint the custom_verify callback in each live SSL_CTX to a stub that
       returns 0 (ssl_verify_ok). cainj already locates SSL_CTX objects (it
@@ -920,6 +936,328 @@ SETUP THAT NOW EXISTS (in the repo, bnetgo/):
   for which cli_dec.bin + srv_dec.bin are a byte-exact template. That is the
   reason this route is worth more than tournament: ground truth instead of
   black-box guessing.
+
+################################################################################
+##  SECTION 7E: THE ADVANCE GATE AND ERROR FLAG - FULL CAUSAL CHAIN
+##                                                          ★ NEW, rev 21
+################################################################################
+
+This fuses Sidiusz's static RE (shared 2026-08-07/09, his image base
+0x7FF749ED0000, derived from the blob HMAC key he placed at 0x7FF74C65CF30
+== our RVA 0x278CF30) with our own dump. His function addresses translate to
+OUR RVAs by subtracting 0x7FF749ED0000, and they land in the SAME lobby
+cluster we mapped in 7B. Cross-checked and disassembled in our dump:
+
+RECEIVE DISPATCH (Sidiusz): routes incoming server messages by a TYPE field
+(u16 at struct+0x28) BEFORE any content check. sub @ our RVA 0x55E980:
+    type 1 -> 0x5601E0 (echo)      type 2 -> 0x560040 (the STATE MACHINE)
+    type 3 -> 0x560370             type 4 -> stamps time
+  A reply MUST be type 2 to reach the state machine. Sidiusz confirmed on the
+  wire: a 13-byte reply with byte[4]=2 was ACCEPTED; the client advanced and
+  sent back 00 00 02 01 03, then retransmitted it awaiting the next reply.
+  (byte[4]=2 is the type field in the 13-byte frame 00 00 0a 01 00 01 00 00
+   00 94 21 d8 11 - note this is how the client's OWN connect is shaped too.)
+
+THE ADVANCE GATE (verified in our dump at 0x561890 and 0x562810):
+    cmp qword [session+0x98], 0   ; +152 = schema registry pointer
+    je  CLOSE                     ; null -> close
+    cmp byte  [session+0x80], 0   ; +128 = error flag (a BYTE)
+    jne CLOSE                     ; nonzero -> close
+  So to advance: session+0x98 != 0 AND session+0x80 == 0.
+  session+0x98 is set by ClientLobbyMessageSystem __LobbyServerConnectionUp
+  when conn+0x94 (conn+148) hits 3.
+  Boi's live read: +0x98 non-null, +0x80 NONZERO -> gate fails. +0x80 is THE
+  blocker. Neither implementer found what writes it. WE FOUND IT:
+
+THE ERROR-FLAG WRITER (our dump, NEW):
+  0x561310  small fn: call 0x560890; destruct [this+0x48]; then
+            mov byte [this+0x80], 1   <-- SETS THE ERROR FLAG
+  Called from exactly ONE site, 0x56459B, inside the RESET routine 0x5643B0.
+  0x5643B0 walks a red-black tree at this+0xF0/+0xF8 (this is the session+192
+  handler rb-tree Sidiusz named - note 0xF0 vs his +192=0xC0 differ; same
+  structure, offset TBD) and flags EVERY entry's session with the error.
+  0x5643B0 has one caller: 0x56BBCD inside 0x56BB9A.
+
+THE TRIGGER (our dump, NEW) - 0x56BB9A:
+    r8d=0x40; call 0x55E890          ; process a 64-BYTE buffer at [this+0x10]
+    mov dword [this+0x110], 4        ; set state = 4
+    mov rcx, [this+0x20]; call 0x5643B0   ; reset + error-flag everything
+  The 0x40 buffer is Sidiusz's "64-byte element array at a3+136". This fn
+  processes the received message's element array, transitions state to 4,
+  THEN runs the teardown that sets the error flag. 0x56BB9A has no direct
+  callers (vtable-dispatched), so the trail ends here statically.
+
+SIDIUSZ'S ELEMENT-ARRAY DECODE (his RE, unverified by us):
+  a3+136 is NOT fixed - parsed from the received message.
+    a2[1] = element count
+    each 64-byte element = { id u32 @[0], flags @[3] bit2 = has payload,
+                             payload ptr @[3] }
+    EACH id is decoded through session+0x98 (the SCHEMA REGISTRY) and routed
+    by id in the session+192 handler rb-tree.
+
+★ REV 23 CORRECTION TO REV 22 - the +0x18/+0x80 offsets do NOT belong to the
+  object at vtable 0x2616260. A live 500Hz watch (owobs v138) of that object
+  showed: +0x18 reads a CONSTANT garbage value (0x36DA5390) forever, and
+  +0x80/+0x84/+0x78/+0x98 are ALL zero/null through every connection cycle.
+  Only +0x70 (state 0->1->2->6) and +0x60 (status) actually move on this
+  object. So Sidiusz's state machine (0x560040) with the +0x18 state field and
+  the +0x80 error flag operates on a DIFFERENT object than vtable 0x2616260.
+  His offsets are into HIS session struct; applying them to the 0x2616260
+  object was an error. CONSEQUENCE: the rev 22 conclusion below ("error flag
+  set early is the trap") is UNPROVEN - it read the wrong offset on the wrong
+  object. The state machine at 0x560040 is real (disassembled) but the object
+  it runs on has NOT been located in memory. Its vtable is unknown; it is not
+  0x2616260. Finding THAT object (the one with a +0x18 field going 2->4->5 and
+  a +0x98 registry pointer) is the prerequisite before any of the +0x18/+0x80
+  reasoning can be tested. The 0x2616260 object remains what we have always
+  watched: +0x70 state, +0x60 status, 5s timeout at state 6.
+
+--- superseded rev 22 text (kept for context, but see correction above) ---
+★ REV 22 (SUPERSEDED): the state machine BUILDS the registry; the error flag
+  is set EARLIER and poisons everything after. Reading the state machine
+  0x560040 and its helpers in full:
+    state field is session+0x18 (Sidiusz "a1+24"), values 0->2->4->5.
+    state==2: call gate A 0x561890, gate B 0x562810; if both pass, set
+              session+0x18=4 and call 0x561D60 (Sidiusz ref 0x561e50).
+    state==3: gate A; then 0x56CCC0; then the JAM ROUTER 0x560D90 dispatches
+              the message; set session+0x18=5 = LOBBY.
+  0x561D60 ALLOCATES a 0x1040-tagged object (call 0x1866230), inits it
+    (0x56C660), registers it (0x41C2A0), and stores it at session+0x78. This
+    +0x78 object backs the schema registry read at +0x98. So the STATE
+    MACHINE ITSELF creates the registry - it is not present beforehand.
+  0x560890 (entry helper) does: clear bit1 of +0x84; if state==0 skip; and
+    ** if byte [session+0x80] != 0, SKIP building the registry **.
+  => If the error flag +0x80 is already set when the reply is processed, the
+     entry helper skips registry setup, +0x98 never becomes non-null, gate A
+     fails forever, connection tears down. The flag being set EARLY is the
+     trap, not the reply content.
+  The ONLY writer of +0x80 is the teardown 0x5643B0 (via 0x561310), triggered
+  by 0x56BB9A - which runs when the connection is DROPPING. 0x56BB9A is
+  vtable-dispatched, so WHAT initiates the teardown is not statically visible.
+  Sidiusz's client got FURTHER (accepted a type-2 reply, sent 0000020103), so
+  on a working path the flag is CLEAR at the critical moment. The difference
+  is timing / a preceding step, NOT the reply bytes.
+  => REAL NEXT QUESTION: why does the client initiate teardown before/while
+     processing our reply? Watch LIVE, in order: session+0x80 (error),
+     +0x18 (state), +0x78 (registry obj), +0x98 (registry ptr) - capture the
+     exact moment +0x80 flips relative to (a) our MAC2+blob, (b) the bare ack,
+     (c) our reply. If +0x80 is already 1 before the reply, the reply is a red
+     herring and the blob/ack sequencing is what trips the teardown.
+  This SUPERSEDES the element-array hypothesis below as the primary lead,
+  though a valid element array may still matter once the flag stays clear.
+
+★ THE (rev 21) ELEMENT-ARRAY HYPOTHESIS - secondary:
+  The reject is NOT content-blind. The type-2 reply carries a 64-byte element
+  ARRAY whose ids must RESOLVE in the client's schema registry (session+0x98).
+  The error flag is set during/after processing that array. So the reply
+  likely must carry element ids that the registry RECOGNISES - i.e. real
+  message/protocol ids from the 922-schema / 105-pool set (Section 2), not
+  arbitrary bytes. Every prior reply (bare, descriptor, msg2) supplied no
+  valid element array, which is consistent with the error path firing.
+  NEXT: construct a type-2 reply whose element array = [count][64B elements],
+  each element carrying a valid schema id (start with the lobby ids 1-4, or
+  the ClientInLobbyConnect ids 20500-20509), flags=0 (no payload), and watch
+  session+0x80 / +0x98 and state (+0x70, +0x110) with owobs. This is the
+  first reply hypothesis grounded in the actual decode path.
+
+CONFIRMED CIPHER/BLOB DETAILS FROM SIDIUSZ (all match our impl):
+  - KAT: key 00..1f -> keystream f07e5df1... (both sides identical).
+  - blob encrypted with rx = hmac(k0, cn||sn); MAC2+blob ONE continuous JAM
+    stream, no reset, partial-block carry into the blob; all 292 bytes offset
+    0 no header. (This is why a PLAINTEXT blob send fails - Boi's bug.)
+  - known-good 292B blob hex is in the transcript / matches build_state_blob.
+
+################################################################################
+##  SECTION 7F: THE PIN CONFIG - FOUND, FORMAT KNOWN, PATCH LIMITS  rev 24
+################################################################################
+
+BIG find: the entire SPKI pin list is a PLAINTEXT JSON blob embedded in the
+exe (in .rdata around RVA 0x2D3B6FA onward), parsed by the pin-config parser
+at 0x216AA20 (which lea-loads "PublicKeys","Uri","ShaHashPublicKeyInfo").
+
+CONFIG STRUCTURE:
+  {"Created":...,
+   "Certificates":[{"Uri":"<host>","ShaHashPublicKeyInfo":"<64 hex>"},...],
+   "PublicKeys":[ ...same shape... ],
+   "SigningCertificates":[{"RawData":"-----BEGIN CERTIFICATE-----MIIGv..."}]}
+  us.actual.battle.net has TWO pins (SHA-256 of SPKI, uppercase hex):
+     4D95474C71708059F69CF0021727927A56FB76AB1BB2EE20CEED789EB2C863E0
+     1D7C8909CE9719FA9167922BE7422CE1923C5AC51511CFC7F50D462BD7E84E40
+  Other pinned hosts: cn/eu/kr/loc/test.actual.battle.net, *.bgs.battle.net,
+  *.dev.battle.net, *.integration.blizzard.com. Full list in the dump.
+
+OUR CA (cainj/bnet_ca.pem) SPKI-SHA256:
+     3ED9ED4D9BC49BB760AA04FF56E4CECF8DDE4057F9ADD23A36B40DD24574158C
+  (openssl x509 -pubkey | openssl pkey -pubin -outform der | openssl dgst
+   -sha256). Exactly 64 hex chars -> same-length swap.
+
+WHAT WE TRIED (owobs v139/v140/v141):
+  - v139 patched the ASCII pin hex EVERYWHERE incl the module image copies
+    (0x00007FF7... pages) -> CRASH. Confirms Sidiusz: writing image pages
+    trips Arxan.
+  - v140 restricted to MEM_PRIVATE + PAGE_READWRITE heap only. No crash.
+    Patched 15 ASCII copies across 3 heap regions (a startup copy + parsed
+    copies). TLS STILL FAILS identically (EOF at cert validation). So the
+    check does NOT read the JSON hex at connection time.
+  - v141 also patched the DECODED 32-byte binary form of both pins in heap.
+    Result: BIN A=0 B=0 - the decoded hashes are NOT stored as plain 32-byte
+    runs anywhere in private heap. TLS still EOF.
+
+CONCLUSION: the pin is parsed once at startup into a structure where the hash
+  is NOT a findable plain byte run (it is inside a larger cert/key object, or
+  the check recomputes and compares without a standing 32-byte copy). Content-
+  patching the pin store has hit its limit. Defeating this pin now requires
+  the VERIFY CODE PATH, not the data:
+    (a) force the comparison RESULT - the verify verdict boolean. This is
+        exactly Sidiusz's "patched the heap-parsed pin/verify result". It is
+        the vtable-dispatched verify method whose FAILURE strings
+        (ssl_public_key_pinning_check_failed @ 0x298E537, etc.) have zero
+        static xrefs - reached only at runtime.
+    (b) the SigningCertificates PEM route - replace the embedded signing CA
+        so the presented chain validates. Untried; the PEM is in the config
+        blob and is a much bigger edit than a hash swap.
+
+★ SHARPENED SIDIUSZ ASK: not "how did you beat the cert wall" generally, but
+  precisely: WHICH FUNCTION did you patch to force the pin/verify result, and
+  at what offset from the module base? He said "hooked the high level pinning
+  and chain verify and forced them to pass in process dll, one shot at load."
+  That function's RVA drops straight into an owobs one-shot patch and opens
+  the whole bnet route (which then follows the retail sequence in srv_dec.bin).
+
+The pin CONFIG being fully known (hosts, hashes, format, parser at 0x216AA20)
+is real progress and is reusable regardless of which bypass finally lands.
+
+################################################################################
+##  SECTION 7G: BNET TRUST MODEL FULLY MAPPED - CONTENT-PATCHING EXHAUSTED
+##                                                          rev 25
+################################################################################
+
+The embedded pin config (RVA 0x2D3B6B0, ~32.7 KB JSON) has FOUR sections:
+  "Certificates":[{Uri, ShaHashPublicKeyInfo}]   50 per-host SPKI pins
+  "PublicKeys":  [{Uri, ShaHashPublicKeyInfo}]   same, second copy
+  "SigningCertificates":[{RawData: <PEM>}]        10 real certs incl.
+        "Battle.net Certificate Authority" (Blizzard root) + DigiCert Global
+  "RootCAPublicKeys": [141 hex strings]           trust-anchor key hashes,
+        stored as SHA-256-ish hex with leading zero-NIBBLES stripped
+        (lengths 57-64). These are public internet roots (DigiCert etc.),
+        NOT the SigningCertificates - the two are independent.
+
+PARSERS (all statically reachable, config strings DO have lea xrefs):
+  0x216AA20  parses Certificates/PublicKeys (Uri + ShaHashPublicKeyInfo)
+  0x216AE20  parses RootCAPublicKeys; per-entry store fn 0xA60A60 pushes
+             40-byte (0x28) STRING objects into a vector (kept as hex text)
+  0x2169F30  reads the parsed bundle sizes (root_ca_hash_size @ rbx+0x50,
+             trusted_certs_size @ rbx+0x38, allowlist @ rbx+0x20) for a
+             telemetry log - shows the bundle object field layout
+  0x216A120  parse orchestrator (refs failed_to_parse_root_ca_key_list)
+  The ENFORCEMENT (hash-and-compare) is NOT among these - it is reached by
+  indirect/vtable dispatch and does not resolve statically, same wall as the
+  JAM handlers and the verify callback.
+
+TWO-LAYER TRUST: the server cert must (a) chain to a RootCAPublicKeys anchor
+  / SigningCertificate AND (b) match the per-host ShaHashPublicKeyInfo SPKI
+  pin. Validation fails at layer (a) first, which is why patching the SPKI
+  pins alone never mattered.
+
+OUR CA (cainj/bnet_ca.pem) SPKI-SHA256:
+  3ED9ED4D9BC49BB760AA04FF56E4CECF8DDE4057F9ADD23A36B40DD24574158C
+
+★ ALL CONTENT-PATCH ATTEMPTS AND RESULTS (owobs v139-v143):
+  v139  ASCII SPKI pins incl image pages        -> CRASH (Arxan, image write)
+  v140  ASCII SPKI pins, heap-only (15 copies)  -> no crash, TLS still EOF
+  v141  + decoded 32-byte SPKI form             -> BIN not found in heap
+  v142  repoint every enum-returning .text ptr  -> CRASH (123 ptrs clobbered)
+  v143  ASCII SPKI pins + RootCAPublicKeys       -> patched 23 copies (pass 3:
+        anchors, heap-only, equal-length              T0=10 T1=5 T2=4 T3=4),
+                                                  TLS STILL EOF
+  CONCLUSION: both trust layers read a DECODED/DERIVED form, not the JSON hex
+  strings. The strings are only the parse source. No content patch of the
+  config affects validation. Content-patching is EXHAUSTED.
+
+★ WHAT REMAINS (both need the enforcement code, not data):
+  1. Force the verify verdict - the vtable-dispatched pin/chain-verify method.
+     Its failure strings (ssl_public_key_pinning_check_failed @ 0x298E537,
+     SSL public key does not match pinned @ 0x298360D, plus the chain-verify
+     and no_public_trust_anchors strings) have ZERO static xrefs. Reached only
+     at runtime. This is what Sidiusz patched.
+  2. A runtime debugger to trace the decoded-hash compare - Arxan/ACG block
+     all of them (DR, x64dbg, ScyllaHide, hardware BP all confirmed dead).
+
+★ THE SIDIUSZ ASK, now maximally precise:
+  "You patched the heap-parsed CA bundle to beat the cert wall. Was it the
+   RootCAPublicKeys chain-anchor check or the per-host SPKI pin check? Which
+   function, and what offset from the module base? I've mapped the whole
+   config (parsers at 0x216AA20 / 0x216AE20) but the enforcement is
+   vtable-dispatched and I can't reach it statically."
+  His offset drops into a one-shot owobs patch and opens the entire bnet
+  route, which then follows the retail sequence in srv_dec.bin.
+
+The bnet CONFIG is now completely mapped (sections, parsers, bundle layout,
+our CA hash ready to insert). Only the enforcement address is missing.
+
+################################################################################
+##  SECTION 7H: THE CALLABLE ADVANCE CHAIN - stateObj FOUND, ROUTER IS THE GATE
+##                                                          rev 26 (TOURNAMENT)
+################################################################################
+
+Back on the tournament path. The lobby-advance state machine and its object are
+now located and reachable by CALLING the client's own functions (the one thing
+Arxan permits). Every address here is verified live.
+
+THE ADVANCE STATE MACHINE  0x560040(this=stateObj, rdx, r8=message)
+  Clean prologue (not Arxan-encrypted), callable. Reads:
+    [this+0x18] = state.  if (state-2 <= 1) i.e. state 2 or 3, proceed.
+    state==2 path: gate A 0x561890, gate B 0x562810; then
+                   [this+0xA0] = 0x23743A0(); [this+0x18]=4; call 0x561D60.
+    state==3 path: gate A; ...; call the ROUTER 0x560D90; [this+0x18]=5 = LOBBY.
+  BOTH gates read [this+0x98] (registry, must be non-null POINTER) and
+  [this+0x80] (error byte, must be 0). Gate B additionally, when [this+0x84]
+  bit0 is set, calls the ROUTER 0x560D90 with a message.
+
+REACHING THE REAL stateObj (by provenance, not signature scan):
+    singleton  = *(base + 0x2F586E0)           # runtime-filled .data global
+    conn       = 0x5DD6B0(singleton)           # map lookup, clean prologue
+    conn+0x94  = the gate Sidiusz named; reaches 3 during handshake
+    stateObj   = *(*(conn + 0x10) + 0x160)     # the true state object
+  On the CONN, +0x98 is a COUNTER (not the registry) - do NOT call the state
+  machine on the conn (v156 did, gate A deref'd a small int and threw).
+  On the stateObj (e.g. live 0x...C93FF0):
+    +0x18 state,  +0x48 critsec (contiguous),  +0x80 error byte,
+    +0x84 flags (observed 473, bit0 SET),  +0x98 registry (real heap ptr,
+    contiguous at obj+0xA0),  +0xA0 another object.
+
+★ PROVEN: STATE IS A PASSIVE VALUE (rev 26)
+  owobs v159 forced stateObj+0x18 = 5 directly (with error cleared) on the real
+  object and watched 20s. The client did NOT revert it and did NOT advance -
+  screen stayed at whatever it was. So the state dword is written by the client,
+  not read as a trigger. Forcing the number does nothing, exactly as forcing the
+  verdict (status +0x60) did nothing in Sections 2M-2O. The client advances by
+  DOING the router's work, not by observing state.
+
+★ THE ROUTER IS UNAVOIDABLE, FROM BOTH SIDES NOW
+  Calling 0x560040 with a ZEROED scratch message throws inside gate B / the
+  router (0x560D90 needs a real message object; movups [rax] on a bad ptr
+  faults; SEH catches it, game survives, state unchanged). This confirms from
+  the function-call side what Sections 2M-2O found from the wire side: the
+  advance requires the real second MESSAGE, delivered through 0x560D90.
+
+★ THE REMAINING TASK (well-scoped, not a mystery):
+  Build a valid message object and call 0x560D90(stateObj, message) directly.
+  We have everything needed that the wire path lacked:
+    - the real stateObj and its registry (this section)
+    - the router 0x560D90, callable (Section 7B)
+    - 922 message schemas + all message-class vtables (Section 2)
+    - allocate_pool at pool vtable slot 7 (Section 2 rev19) - the client's OWN
+      message constructor; 112 pool instances live (Section 7 rev19)
+  PLAN: find the lobby / ClientInLobbyConnect pool instance, call
+  allocate_pool(pool, msgId) to have the CLIENT build a correct empty message,
+  populate its payload fields (offsets 0x78+ from the schema), then call
+  0x560D90(stateObj, msg). This is Prometheus's method end to end: construct
+  with the client's allocator, dispatch with the client's router. It needs
+  careful multi-step pointer construction and should be built fresh, not tired.
+
+TOOLING THIS SECTION: owobs v155 (safe conn probe), v157 (stateObj finder),
+  v159 (state=5 force, proved passive). All read-only except the state force.
 
 ################################################################################
 ##  SECTION 8: VOID - DO NOT USE
@@ -1124,10 +1462,6 @@ BNET / CERT ROUTE (alternative, converges on the same wall)
 ################################################################################
 
 Independent implementers who reached this exact wall:
-  - Sidiusz - reconstructed the same handshake field-for-field, solved the
-    cert pinning, reached the web-auth login form, stuck at the same point.
-    Confirmed 2026-08-09: "I don't have it either" re: the reply to 0x0103.
-    Stopped work on OW1 in August 2026.
   - Zagrion (AyakaPS) - contributed the s2c key derivation and the tshark
     reassembly method that made srv_dec.bin possible.
   - iEvE - has PRIVATELY reached the main menu on 1.74 in TOURNAMENT MODE
