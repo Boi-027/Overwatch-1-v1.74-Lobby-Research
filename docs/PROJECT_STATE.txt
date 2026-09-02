@@ -1,7 +1,7 @@
 ================================================================================
   Overwatch 1.74.0.0 - Local Preservation Server: Project State & Handoff
   Build 104319, Windows x64 (retail product, _retail_ folder, Product=pro)
-  Last updated: 2026-09-01 (rev 26)
+  Last updated: 2026-09-01 (rev 29)
 ================================================================================
 
 MAIN GOAL
@@ -1260,6 +1260,225 @@ TOOLING THIS SECTION: owobs v155 (safe conn probe), v157 (stateObj finder),
   v159 (state=5 force, proved passive). All read-only except the state force.
 
 ################################################################################
+##  SECTION 7I: THE DECRYPTED DUMP + THE CURL PIN FUNCTION LOCATED  rev 27
+################################################################################
+
+★ TWO DUMPS - USE THE RIGHT ONE:
+  - overwatch_dump.bin (58MB, pe-sieve): has the pin config JSON and code, but
+    the cURL/CSSL pin CODE regions are still obfuscated - the pin strings have
+    ZERO lea xrefs, function boundaries break. This is what blocked static
+    analysis of the pin all along.
+  - 7ff64a690000_Overwatch.exe (46MB, memtool live capture, base 0x7ff64a690000):
+    DECRYPTED. The SAME pin strings now have WORKING lea xrefs and the cURL code
+    disassembles cleanly. THIS is the dump that makes the pin analyzable.
+    (It lacks the heap, so the derived/decoded moduli are still not in it - the
+    "used copy" every scan missed lives in transient heap, in neither dump.)
+  In the memtool dump, dump-offset == RVA (image is base-aligned).
+
+★ THE BNET PIN IS cURL PUBLIC-KEY PINNING (Curl_pin_peer_pubkey):
+  - The client's TLS on 1119 goes through cURL (3rdparty\openssl paths, 295
+    hits; schannel strings; CSSL wrapper). Confirmed.
+  - Curl_pin_peer_pubkey @ RVA 0x240DF65. Returns CURLE_OK(0) on match,
+    CURLE_SSL_PINNEDPUBKEYNOTMATCH(90) on mismatch (the single "mov eax,0x5A"
+    in .text is at 0x240E29C).
+  - It reads the peer cert SPKI via repeated calls to 0x23DBFC0 (tags
+    0x1000/0x1001/0x1002), builds the key, then calls THE COMPARE:
+        0x240D6C0  the pin comparison (peer SPKI-hash vs pinned value)
+    at pin-fn site 0x240E16D: mov rcx,rbx; call 0x240D6C0; test eax,eax;
+    mov edi,1; ... return edi.
+  - 0x240D6C0 early-outs: test rcx / [rcx] / [rcx->0xB8]==0 -> 0x240D7FB, but
+    0x240D7FB returns 0xFFFFFFFE (-2, an ERROR path), NOT a skip/OK. So nulling
+    [+0xB8] does NOT cleanly bypass - it errors.
+  - The verdict string "SSL public key does not match pinned public key" @ RVA
+    0x29835F0 is only referenced by the cURL error-string TABLE at 0x2148127
+    (curl_easy_strerror), not by the check - a red herring for finding it.
+
+★ BYPASS OPTIONS (in order of Arxan-safety), none finished:
+  1. DATA: make cURL's pinnedpubkey config genuinely UNSET so cURL skips
+     calling Curl_pin_peer_pubkey entirely. cURL: if(!pinnedpubkey) return
+     CURLE_OK. The config lives in the SSL-setup struct (a data field). Finding
+     it live is the task - the caller of 0x240DF65 is vtable-dispatched so it is
+     not reachable by static xref; needs a runtime scan of the cURL easy/ssl
+     config for the pinnedpubkey pointer.
+  2. CODE: patch 0x240DF65 or 0x240D6C0 to return match. This is .text -> ACG
+     denies VirtualProtect (owobs v152: err 87 on the schannel branch pages,
+     same wall). Needs whatever write method Sean uses (see below).
+  3. MODULUS SWAP (Sean's method): overwrite the Blizzard root modulus in the
+     DERIVED heap copy (not the JSON/raw copies we patched in v143-v151, which
+     are never read). Triggers a TAMPER SELF-DESTRUCT (random 0-120s) that must
+     ALSO be defeated.
+
+★ SEAN (community, 0.8 build) reached the 0.8 menu by patching the RSA modulus
+  in memory, and confirmed a "randomized self-destruct, immediate to 120s" that
+  is a TAMPER CHECK reacting to the patch. He is actively asking for help with
+  it. His two pieces of knowledge are exactly what gates bnet here:
+    (a) how he writes the patch (which .text write method survives, or which
+        derived copy to hit), and
+    (b) the tamper-check / self-destruct workaround.
+  NOTE: Sean is on 0.8 beta (Prometheus-class), NOT 1.74 - his menu is not the
+  1.74 lobby wall. But the modulus technique and the self-destruct are shared
+  Blizzard mechanisms and his answers likely transfer to the bnet route.
+
+WHY THE BNET ROUTE STILL LEADS SOMEWHERE: if the pin is bypassed, the client
+completes TLS on 1119 (openssl s_client already gets TLS OK against bnet-mock),
+proceeds through the retail bnet RPC, and follows the RETAIL lobby sequence for
+which srv_dec.bin is a byte-exact template. That is ground truth the tournament
+path lacks.
+
+################################################################################
+##  SECTION 7J: THE CONNECTION-SYSTEM VIEW + PROMETHEUS CLIENT-FORCING  rev 28
+################################################################################
+
+Looking through everything + Prometheus (saturn-xvi/prometheus) README revealed
+a THIRD view of the same wall and one genuinely unexplored avenue.
+
+★ LobbyClientConnectionSystem STATE MACHINE (1.74, strings @ 0x2D465E1 cluster):
+    AUTH_LOBBY  ->  HANDING_OFF_JAM  ->  CONNECTED
+  This is the connection LIFECYCLE, distinct from the JAM message router. The
+  "HANDING_OFF_JAM" state is exactly the transition where the connection system
+  hands control to the JAM layer - i.e. the same point our msg-3/router advance
+  targets. So all THREE views converge on one wall:
+    (1) wire: unknown advancing message (only bare acks accepted)
+    (2) JAM router 0x560D90(subsystem, empty msg-3) - Section 7H/7I
+    (3) LobbyClientConnectionSystem: HANDING_OFF_JAM -> CONNECTED (this section)
+  Also present: CONNECTION_STATE_{NONE,CONNECTING,CONNECTED,DISCONNECTED,
+  DISCONNECTING,PENDING_DESTROY}, NETWORK_STATE_{...}. The state-name strings
+  are debug labels reached via an indirect table (no lea xref), so the state
+  code is not directly reachable by string xref.
+
+★ STATESCRIPT IS PRESENT IN 1.74 (strings: "Statescript" @ 0x2EADC0C,
+  "Statescript Var Pool" @ 0x2EADF0C, "EntityAdmin" @ 0x2E4A30C). The runtime
+  Statescript data lives PAST our dump truncation (~0x2EAD000+), so it exists
+  live but we cannot analyze it statically from the current dumps.
+
+★ PROMETHEUS METHOD = CLIENT-SIDE STATE FORCING, NOT A SERVER (genuinely
+  unexplored on 1.74):
+  Prometheus reaches the 0.8 menu with NO lobby server. Its patcher hooks
+  TlsCallback_0 to load inject.dll BEFORE the game runs, "restores the game to
+  its original state, decrypts everything", then drives the client:
+    - Entity Admins init in order: Lobby, Game, Replay.
+    - The LOGIN FLOW is "implemented asynchronously in Statescript Actions".
+    - The LobbyEntityAdmin holds login/user info; the lobby menu is Statescript-
+      driven, NOT driven by the JAM lobby handshake.
+    - Prometheus states plainly: "Main Menu buttons only send JAM messages
+      saying 'i want to join a game', so that needs to be implemented" - i.e.
+      even AT the 0.8 menu, the server side is NOT done. Prometheus is menu-by-
+      client-forcing, not menu-by-server.
+  IMPLICATION (INITIALLY PROMISING): force the Statescript login flow client-
+  side to reach the menu, bypassing the JAM handshake.
+
+  ★★ RULED OUT rev 28 - STRING EVIDENCE. Prometheus's method depends on the 0.8
+  DEV BUILD's debug UI and machinery, which 1.74 RETAIL DOES NOT HAVE:
+    searched the 1.74 dump for the 0.8 dev-menu / client-forcing path:
+      "DP Load"        : 0      "Demo"           : 0
+      "AfterDataPack"  : 0      "DataPack"       : 0
+      "PRIVATE GAME (DEV ONLY)": 0   dev menu bar strings: 0
+    Only tank_ShowMode/ShowMode exist (4/2 hits) - not the dev menu.
+  Sean's menu screenshots and the Prometheus log (Emplacing TACT key, Hook
+  AfterDataPack, Demo->DP Load) are ALL the 0.8 dev build (GameClientApp.exe,
+  "BETA - 0.8.0.0 - 24919", Jeff Kaplan account, dev menu). 0.8 boots to a menu
+  WITHOUT a server; 1.74 retail hard-blocks on the server (confirms Section 5).
+  There is NO client-side menu shortcut in 1.74 - the dev path was stripped.
+  CONSEQUENCE: the 1.74 menu REQUIRES a real server the client accepts. The
+  tournament JAM handshake (Sections 7H-7I: router 0x560D90 + empty msg-3) is
+  the genuine frontier; the bnet route needs the pin bypass. No client-forcing
+  escape hatch exists. This is WHY 1.74 is unsolved where 0.8 is not.
+
+  ALSO NOTE re "our bnet server said TLS OK on 0.8": that only proves 0.8's
+  client does NOT pin like 1.74's - the server (bnet-mock + 4096 cert) is
+  provably correct (openssl gets TLS OK too). Same server, different client
+  strictness. It is NOT evidence the server is wrong for 1.74.
+  BLOCKER TO STARTING IT: need (a) a fuller process dump including the
+  Statescript var-pool region (>0x2EAD000) to analyze the login-flow actions,
+  and/or (b) the TlsCallback_0 early-inject technique (earlier than the current
+  bink proxy, before Arxan/ACG fully arm - may also help the .text-write walls).
+
+★ THE PROMETHEUS AUTHOR is BreakingBread0 (contact@breakingbread.at), who
+  publicly invites contact and wrote the client-forcing + Statescript + entity-
+  admin tooling. He is the ideal contact for the client-side avenue, which is
+  the genuinely new direction and does NOT depend on beating the JAM handshake
+  or the bnet pin. (Also authored imnodes fork; deep OW internals knowledge.)
+
+TlsCallback_0 EARLY-INJECT (Prometheus patcher technique) - worth trying vs the
+  ACG .text-write wall: injecting at TlsCallback_0 runs before the game's own
+  code and before protections finish arming; Prometheus uses exactly this to
+  "decrypt everything and hook stuff". Our bink proxy loads later. This is a
+  concrete, testable idea for the .text patches (schannel je-flip, verify
+  result) that ACG currently denies.
+
+################################################################################
+##  SECTION 7K: FULL HEAP DUMP - GROUND TRUTH ON ALL THREE ROUTES  rev 29
+################################################################################
+
+A continuous best-of module dump (owobs v177, 93.8% pages decrypted) plus a
+FULL process dump (owobs v178: module + all ~6300 heap regions) were taken. The
+heap is the thing every prior dump lacked. Targeted searches (find_in_dumps.py,
+find_subsystem.py with the 105 pool CRCs) located the key regions. This gives
+GROUND TRUTH that closes long-open questions with evidence, not inference.
+
+★ BNET PIN - NO DATA BYPASS EXISTS (heap-proven):
+  - The pin config JSON is in heap ONLY as ASCII hex (dump_heap_01d8ae9a0000).
+    The us.actual pins 4D95474C.../1D7C8909... appear only as text.
+  - The DECODED 32-byte pin hash is NOT anywhere in plain heap.
+  - The Blizzard root modulus IS in heap in LE (BIGNUM) form
+    (dump_heap_01d863d1e000 @ VA 0x1d863de16a0) and BE form, but:
+      * no Montgomery RR anywhere (root key never RSA-imported for verify)
+      * the LE copy has no BIGNUM struct pointing at it nearby
+  => The pin comparison value is COMPUTED TRANSIENTLY inside
+     Curl_pin_peer_pubkey (0x240DF65 -> compare 0x240D6C0); it is never stored
+     in patchable memory. This definitively ends the "find the right heap copy
+     to patch" approach (v143/v146/v151/v169 all failed for this reason). The
+     ONLY bnet bypass is forcing the pin function's RESULT = a .text write =
+     ACG-blocked. Needs the TlsCallback_0 early-inject.
+
+★ TOURNAMENT SUBSYSTEM - FOUND, BUT READINESS GATE UNMET (heap-proven):
+  Region dump_heap_01a23ddd0000 (tournament-mode dump) holds 87 of the 105
+  protocol CRCs = the JAM subsystem's association map. Confirmed structure:
+    - BST node (router's map): left@+0x08, right@+0x10, key@+0x20(u32 CRC),
+      value@+0x28. Real node e.g. @ 0x1a23e163160 (key=lobby 0x11D82194).
+    - Many image-vtable objects whose +0xC0 points to CRC-bearing nodes exist
+      (the map machinery), with +0x18=1.
+  ROUTER 0x560D90 precise contract (re-verified): this=rcx=r14;
+    enters critsec [r14+0x48]; requires [r14+0x78]!=0 AND [[r14+0x78]+0x20]==6;
+    compares [r14+0x18] to 5; map root at [r14+0xC0]; msg CRC via 0x565240.
+  ★ NO object in the heap has [+0x78]->+0x20==6 at the wall. The subsystem and
+    its map exist, but the READINESS-STATE object (the +0x78 target whose +0x20
+    must be 6) is never set to 6 while parked at the wall. That state is set by
+    completing the real handshake - the same circular blocker seen from the wire
+    (Sections 2,4), the state machine (7H), and the connection system (7J), now
+    PROVEN from live heap. Routing an empty msg-3 cannot succeed until +0x78's
+    +0x20 becomes 6, and nothing we can do client-side sets it.
+
+★ CLIENT-FORCING (Prometheus) - machinery present, anchors unreachable:
+  1.74 has the datapack loader (0x171ace0), TACT keys (the 15 in owobs match
+  Prometheus's hardcoded set), Replay/EntityAdmin/Statescript. But the
+  EntityAdmin globals (0.8: LobbyEntityAdmin=*(base+0x1833e18)) are reached via
+  Arxan-obfuscated code, and structural heap scans for the EA drown in false
+  positives (the 0.8 offsets don't map to 1.74; component_iterator[0x23] check
+  found nothing). Non-tournament heap dumps don't contain the tournament JAM
+  subsystem (different launch path). Porting needs ~6 more 0.8->1.74 offsets AND
+  inline hooks (MinHook) which ACG blocks -> needs early-inject.
+
+★ THE CONVERGENT ROOT WALL (all routes, evidence-backed):
+  1.74's Arxan + ACG let us READ/MAP everything but reliably LOCATE-live or
+  WRITE-code nothing. Every route ends here:
+    - data patches: land but aren't what's read (pin), or the ready-state isn't
+      set (tournament) - both heap-proven now.
+    - code patches: ACG denies VirtualProtect on all .text (err 87).
+    - object location: obfuscated globals / false-positive scans.
+  THE ONE LEVER: TlsCallback_0 early-inject (RVAs 0x2499d40, 0x249f410 x2,
+  0x2101790). Prometheus uses exactly this on 0.8 - inject before Arxan decrypts
+  /arms, in the window where globals resolve and .text is writable. UNTESTED
+  against 1.74's stronger ACG; may trip the tamper self-destruct Sean hit. This
+  is the single technique that could unlock bnet (force pin result), tournament
+  (write the +0x78 ready-state or hook the handshake), and client-forcing
+  (install the EA/datapack hooks) - because all three are gated on ACG.
+
+FILES: v177 (best-of module dump), v178 (full process dump), find_in_dumps.py /
+  find_subsystem.py (locate regions by content). The tournament subsystem is in
+  dump_heap_01a23ddd0000 (87 CRCs). The bnet pin fn is 0x240DF65.
+
+################################################################################
 ##  SECTION 8: VOID - DO NOT USE
 ################################################################################
 
@@ -1462,6 +1681,10 @@ BNET / CERT ROUTE (alternative, converges on the same wall)
 ################################################################################
 
 Independent implementers who reached this exact wall:
+  - Sidiusz - reconstructed the same handshake field-for-field, solved the
+    cert pinning, reached the web-auth login form, stuck at the same point.
+    Confirmed 2026-08-09: "I don't have it either" re: the reply to 0x0103.
+    Stopped work on OW1 in August 2026.
   - Zagrion (AyakaPS) - contributed the s2c key derivation and the tshark
     reassembly method that made srv_dec.bin possible.
   - iEvE - has PRIVATELY reached the main menu on 1.74 in TOURNAMENT MODE
