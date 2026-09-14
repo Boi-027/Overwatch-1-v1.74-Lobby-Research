@@ -4,13 +4,9 @@ Reverse-engineering the Overwatch 1 lobby protocol (build **1.74.0.0 / 104319**)
 with the goal of reaching the main menu on a fully local, offline server. Game
 preservation, own machine, own copy.
 
-**Status: The client has been made to advance PAST the lobby wall for the first
-time.** The transport is solved, the client completes the handshake and holds an
-open connection, and - new - the client's own accept path can be driven so it
-leaves the retry loop and moves to "ENTERING GAME". What remains is the second
-server message: the accept and the client's poll loop are two separate
-subsystems, and the poll still wants a response we can't yet form. This repo
-exists so that work isn't repeated.
+**Status: ON HIATUS**
+
+This repo exists so that work isn't repeated.
 
 (Also, someone has managed to get into the main menu already and is planning to release a full game server, 
 this project is to see weather or not we can get into the Main Menu before they release their private server.)
