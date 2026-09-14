@@ -4,7 +4,7 @@ Reverse-engineering the Overwatch 1 lobby protocol (build **1.74.0.0 / 104319**)
 with the goal of reaching the main menu on a fully local, offline server. Game
 preservation, own machine, own copy.
 
-**Status: ON HIATUS**
+**Status: Currently moving to non-tournament mode route, unable to finish just from tournament mode, ABLE TO REACH LOGIN FORM.**
 
 This repo exists so that work isn't repeated.
 
