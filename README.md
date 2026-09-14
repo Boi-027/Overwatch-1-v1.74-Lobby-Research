@@ -6,6 +6,8 @@ preservation, own machine, own copy.
 
 **Status: Currently moving to non-tournament mode route, unable to finish just from tournament mode, ABLE TO REACH LOGIN FORM.**
 
+![image](progress%20images/image.png)   
+
 This repo exists so that work isn't repeated.
 
 (Also, someone has managed to get into the main menu already and is planning to release a full game server, 
