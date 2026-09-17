@@ -4,14 +4,17 @@ Reverse-engineering the Overwatch 1 lobby protocol (build **1.74.0.0 / 104319**)
 with the goal of reaching the main menu on a fully local, offline server. Game
 preservation, own machine, own copy.
 
-**Status: Currently moving to non-tournament mode route, unable to finish just from tournament mode, ABLE TO REACH LOGIN FORM.**
+**Status: ON HIATUS INDEFINITLY.** 
+
+As of today (September 17th, 2026), 4-5 people have managed to get into the Overwatch 1.74 Main Menu. I would like to leave all of that to them and I wish them the best of luck in bringing back this game that was taken away from us.
+Thanks to everyone who showed support <3
 
 ![image](progress%20images/image.png)   
 
 This repo exists so that work isn't repeated.
 
 (Also, someone has managed to get into the main menu already and is planning to release a full game server, 
-this project is to see weather or not we can get into the Main Menu before they release their private server.)
+this project is to see wheather or not we can get into the Main Menu before they release their private server.)
 
 ---
 
