@@ -14,7 +14,7 @@ Thanks to everyone who showed support <3
 This repo exists so that work isn't repeated.
 
 (Also, someone has managed to get into the main menu already and is planning to release a full game server, 
-this project is to see wheather or not we can get into the Main Menu before they release their private server.)
+this project is to see whether or not we can get into the Main Menu before they release their private server.)
 
 ---
 
