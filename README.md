@@ -9,6 +9,9 @@ preservation, own machine, own copy.
 As of today (September 17th, 2026), 4-5 people have managed to get into the Overwatch 1.74 Main Menu. I would like to leave all of that to them and I wish them the best of luck in bringing back this game that was taken away from us.
 Thanks to everyone who showed support <3
 
+EDIT: Someone was willing to share their own notes that pick up where I left off in my PROJECT_STATE.txt! If you want to learn more about Login, Loot Boxes, and more go to this [link!](https://rentry.co/3bswrgmw#overwatch-174-lobby-protocol-channel-setup-login-and-loot-boxes)
+
+
 ![image](progress%20images/image.png)   
 
 This repo exists so that work isn't repeated.
